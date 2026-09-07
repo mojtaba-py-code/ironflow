@@ -1,0 +1,121 @@
+# Worked example: incremental extraction from PostgreSQL into a warehouse table.
+#
+# Demonstrates the watermark mechanics that a full-load pipeline never exercises:
+# an overlap window, CDC deduplication, upsert loading and a post-load SQL task.
+
+include: [_defaults.yaml]
+
+name: customers_incremental
+version: "1"
+description: Sync changed customer rows from the operational database.
+owner: data-engineering
+tags: [customers, incremental]
+
+tasks:
+  - name: sync_customers
+    description: Pull rows changed since the last successful run.
+
+    source:
+      type: postgres
+      # Credentials are references, never values. `ironflow secrets encrypt`
+      # produces an `enc:` envelope if you cannot use an environment variable.
+      dsn: env:CUSTOMERS_DSN
+      table: public.customers
+      # The engine appends `updated_at > :__watermark__` as a *bound parameter*.
+      order_by: [updated_at]
+      fetch_size: 5000
+      require_tls: true
+
+    strategy: cdc
+    incremental:
+      column: updated_at
+      # Re-read a 30-second overlap. A row committed at 10:00:05 can carry
+      # updated_at = 10:00:00; without the overlap it is invisible forever.
+      overlap: 30
+      # ...and dedupe what the overlap re-delivers.
+      key_columns: [customer_id]
+
+    schema_evolution:
+      mode: additive                    # new columns fine; a removed one fails
+      fail_on_removed_columns: true
+      fail_on_type_change: true
+
+    transformations:
+      - type: cast
+        columns:
+          customer_id: integer
+          created_at: datetime
+          updated_at: datetime
+      - type: string_ops
+        columns: [country_code]
+        operations: [trim, upper]
+      - type: mask_pii
+        columns: [email, phone]
+        strategy: auto
+      - type: fill_null
+        columns:
+          country_code: "UNKNOWN"
+          segment: "unclassified"
+      - type: add_metadata
+        include: [execution_id, loaded_at]
+
+    validation:
+      on_violation: quarantine
+      max_errors: 500
+      schema:                           # compact form; expands into rules
+        customer_id: { type: integer, nullable: false, unique: true }
+        country_code: { max_length: 3 }
+        updated_at: { type: datetime, nullable: false }
+      rules:
+        - type: sequence                # detects an out-of-order/replayed feed
+          field: updated_at
+          severity: warning
+
+    destination:
+      type: postgres
+      dsn: env:WAREHOUSE_DSN
+      table: analytics.dim_customer
+      mode: upsert
+      key_columns: [customer_id]
+      chunk_size: 1000
+
+    reject_destination:
+      type: postgres
+      dsn: env:WAREHOUSE_DSN
+      table: analytics.dim_customer_rejects
+      mode: append
+      create_table: true
+
+    retry:
+      max_attempts: 3
+      initial_delay: 5
+      max_delay: 120
+
+  # Post-load maintenance. `type: sql` runs a statement and nothing else.
+  - name: refresh_statistics
+    type: sql
+    depends_on: [sync_customers]
+    condition: "state.sync_customers.rows_out > 0"
+    on_failure: continue                # a stale ANALYZE must not fail the load
+    sql: "ANALYZE analytics.dim_customer"
+    destination:
+      type: postgres
+      dsn: env:WAREHOUSE_DSN
+      table: analytics.dim_customer
+
+schedule:
+  cron: "*/30 * * * *"
+  timezone: UTC
+  max_concurrent_runs: 1                # two runs would race on the watermark
+
+notifications:
+  - type: slack
+    target: env:SLACK_WEBHOOK_URL
+    on: [failed, partial]
+  - type: console
+    on: [success, failed]
+
+profiles:
+  production:
+    defaults:
+      batch_size: 50000

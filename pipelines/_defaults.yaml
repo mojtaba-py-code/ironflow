@@ -1,0 +1,13 @@
+# Shared fragment. The leading underscore keeps it out of pipeline discovery;
+# other files pull it in with `include: [_defaults.yaml]`.
+
+defaults:
+  batch_size: 10000
+  retry:
+    max_attempts: 3
+    initial_delay: 2
+    max_delay: 60
+    multiplier: 2
+    jitter: true
+
+max_parallel_tasks: 4

@@ -1,0 +1,28 @@
+# Normalise line endings in the repository to LF regardless of the contributor's
+# platform or their `core.autocrlf` setting. Without this a Windows checkout can
+# commit CRLF, which turns the next diff on Linux into a whole-file rewrite and
+# breaks the shell scripts inside the container image.
+* text=auto eol=lf
+
+# Files that must keep LF even in a Windows working copy: they are executed by
+# a POSIX shell or a container, where CRLF is a syntax error.
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+
+# Windows-only files keep CRLF.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Never touch these.
+*.parquet   binary
+*.xlsx      binary
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.gz        binary
+*.zip       binary
+
+# Keep generated or vendored content out of the language statistics and out of
+# diffs, so the repository's language breakdown reflects what was written here.
+docs/**     linguist-documentation

@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+
+# IronFlow runtime state - never commit run history, checkpoints or audit logs
+.ironflow/
+*.db
+*.db-wal
+*.db-shm
+logs/
+reports/
+checkpoints/
+audit/
+
+# Secrets. Only .env.example belongs in git.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Working data is never committed. The small fixtures the bundled example
+# pipelines read from are, so `ironflow pipeline run sales_daily` works against
+# a fresh clone (it needs IRONFLOW_HASH_KEY exported; `config init` scaffolds a
+# zero-setup example instead).
+data/*
+!data/sample/
+!tests/**/data/
+*.parquet
+*.xlsx
+!docs/**/*.xlsx
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

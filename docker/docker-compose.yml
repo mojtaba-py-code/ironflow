@@ -1,0 +1,84 @@
+# Local stack: PostgreSQL for control-plane state, the API/dashboard, and the
+# scheduler. Run from the repository root:
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# The scheduler runs as a single replica on purpose: it holds no distributed
+# lock, so two replicas would double-trigger every job.
+
+name: ironflow
+
+x-ironflow-common: &ironflow-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  environment: &ironflow-env
+    IRONFLOW_ENVIRONMENT: development
+    IRONFLOW_LOG_JSON: "true"
+    IRONFLOW_LOG_LEVEL: INFO
+    IRONFLOW_HOME: /var/lib/ironflow
+    IRONFLOW_PIPELINES_DIR: /etc/ironflow/pipelines
+    IRONFLOW_DATA_ROOTS: /data
+    IRONFLOW_STATE_DATABASE_URL: postgresql+psycopg://ironflow:${POSTGRES_PASSWORD:-ironflow}@postgres:5432/ironflow
+    IRONFLOW_ENCRYPTION_KEY: ${IRONFLOW_ENCRYPTION_KEY:-}
+    # These two go together: with auth on, a signing secret under 32 characters
+    # makes every token forgeable, so the container refuses to start without one.
+    IRONFLOW_AUTH_ENABLED: ${IRONFLOW_AUTH_ENABLED:-false}
+    IRONFLOW_JWT_SECRET: ${IRONFLOW_JWT_SECRET:-}
+  volumes:
+    - ../pipelines:/etc/ironflow/pipelines:ro   # definitions are read-only to the app
+    - ../data:/data
+    - ironflow-state:/var/lib/ironflow
+  depends_on:
+    postgres:
+      condition: service_healthy
+  # Hardening that costs nothing locally and matches production.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ironflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ironflow}
+      POSTGRES_DB: ironflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ironflow -d ironflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # Not published: only the compose network needs to reach it.
+    expose:
+      - "5432"
+
+  api:
+    <<: *ironflow-common
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      <<: *ironflow-env
+      IRONFLOW_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8080:8080"   # bound to loopback; put a proxy in front to expose it
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  scheduler:
+    <<: *ironflow-common
+    command: ["schedule", "start", "--poll", "30"]
+    deploy:
+      replicas: 1   # must stay 1: no distributed lock
+
+volumes:
+  postgres-data:
+  ironflow-state:

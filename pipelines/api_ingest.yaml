@@ -1,0 +1,125 @@
+# Worked example: ingesting a paginated REST API and enriching from a lookup.
+#
+# Demonstrates the API-side features: OAuth2, pagination, rate limiting, nested
+# JSON flattening and a lookup join.
+
+include: [_defaults.yaml]
+
+name: api_ingest
+version: "1"
+description: Ingest orders from the partner REST API and enrich with regions.
+owner: integrations
+tags: [api, partner]
+
+variables:
+  curated: ./data/curated
+  reference: ./data/sample
+
+tasks:
+  - name: fetch_partner_orders
+    description: Page through the partner API and land curated rows.
+
+    source:
+      type: rest
+      url: https://api.partner.example.com/v2/orders
+      method: GET
+
+      # Client-credentials grant; the token is cached until shortly before it
+      # expires, so a 10,000-page run performs one token request.
+      auth: oauth2
+      token_url: https://auth.partner.example.com/oauth2/token
+      client_id: env:PARTNER_CLIENT_ID
+      client_secret: env:PARTNER_CLIENT_SECRET
+      scope: orders:read
+
+      # Belt and braces on top of the SSRF guard: even a compromised DNS entry
+      # cannot redirect this connector somewhere else.
+      allowed_hosts: [api.partner.example.com]
+
+      pagination: cursor
+      cursor_path: meta.next_cursor
+      page_size: 500
+      max_pages: 2000
+      data_path: data.orders
+
+      rate_limit: 8                  # requests/second, per the partner's quota
+      timeout: 60
+      retry:
+        max_attempts: 5
+        initial_delay: 2
+        max_delay: 60
+
+    transformations:
+      # API payloads are nested; flatten before anything else touches them.
+      - type: flatten
+        separator: "."
+        max_depth: 3
+
+      - type: rename
+        mapping:
+          "id": order_id
+          "customer.email": customer_email
+          "totals.gross": gross_amount
+          "totals.currency": currency
+
+      - type: select                 # pin the schema so Parquet stays stable
+        columns:
+          [order_id, customer_email, gross_amount, currency, status, created_at]
+
+      - type: cast
+        columns:
+          gross_amount: float
+          created_at: datetime
+
+      - type: convert_currency
+        columns: [gross_amount]
+        currency_column: currency
+        rates: { EUR: 1.0, USD: 0.92, GBP: 1.17 }   # config, not a live lookup
+        target_column_suffix: _eur
+        precision: 2
+
+      - type: join                   # small dimension, large fact: the right shape
+        source:
+          type: csv
+          path: "${var.reference}/currency_regions.csv"
+        left_on: [currency]
+        right_on: [currency]
+        how: left
+        columns: [region]
+
+      - type: mask_pii
+        columns: [customer_email]
+        strategy: email
+
+      - type: deduplicate            # blocking: keeps one hash per distinct key
+        columns: [order_id]
+        keep: last
+        order_by: "created_at desc"
+
+      - type: add_metadata
+        include: [execution_id, loaded_at, source]
+
+    validation:
+      on_violation: quarantine
+      max_error_rate: 0.02
+      rules:
+        - { type: not_null, field: order_id }
+        - { type: unique,   field: order_id }
+        - { type: range,    field: gross_amount, min: 0 }
+        - { type: in_set,   field: status, values: [pending, paid, shipped, cancelled] }
+        - { type: date_format, field: created_at, min_date: "2020-01-01" }
+
+    destination:
+      type: parquet
+      path: "${var.curated}/partner_orders.parquet"
+      mode: overwrite
+
+    reject_destination:
+      type: json
+      path: "${var.curated}/partner_orders_rejected.jsonl"
+      mode: overwrite
+
+notifications:
+  - type: webhook
+    target: env:OPS_WEBHOOK_URL
+    on: [failed]

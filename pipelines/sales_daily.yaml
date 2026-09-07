@@ -1,0 +1,168 @@
+# Worked example: a daily sales load with quality gates and PII handling.
+#
+# `hash_columns` below needs a key, so export one first - the pipeline refuses
+# to fall back to an unkeyed digest:
+#
+#   export IRONFLOW_HASH_KEY="$(openssl rand -base64 32)"
+#
+#   ironflow pipeline validate sales_daily
+#   ironflow pipeline run sales_daily --dry-run
+#   ironflow pipeline run sales_daily
+
+include: [_defaults.yaml]
+
+name: sales_daily
+version: "1"
+description: Curate the daily order export and publish a regional summary.
+owner: data-engineering
+tags: [sales, daily, tier-1]
+
+variables:
+  # Committed fixtures, so this pipeline runs against a fresh clone once
+  # IRONFLOW_HASH_KEY is exported. Point `raw` at a real export (or override
+  # it: --var raw=/mnt/exports) for actual use.
+  raw: ./data/sample
+  curated: ./data/curated
+
+parameters:
+  full_refresh: false          # override at run time: --param full_refresh=true
+
+tasks:
+  # ------------------------------------------------------------------ orders
+  - name: load_orders
+    description: Clean, validate and curate the order export.
+
+    source:
+      type: csv
+      path: "${var.raw}/orders.csv"
+      encoding: utf-8
+      null_values: ["", "NULL", "N/A", "-"]
+
+    transformations:
+      # 1. Make the column names predictable before anything references them.
+      - type: normalize_columns          # "Order Date" -> order_date
+
+      # 2. Types next, so later steps and validation see real numbers/dates
+      #    rather than the strings a CSV reader returns.
+      - type: cast
+        columns:
+          order_id: integer
+          customer_id: integer
+          quantity: integer
+          unit_price: float
+          discount: float                # every column an expression touches
+          order_date: date
+        on_error: "null"                 # bad values become null and get quarantined
+
+      # Missing discounts become 0 *before* the arithmetic below. Leaving them
+      # as empty strings would make `1 - discount` text arithmetic, which the
+      # expression evaluator refuses rather than silently producing nonsense.
+      - type: fill_null
+        columns:
+          discount: 0.0
+
+      # 3. Filter early: every later step then processes fewer rows.
+      - type: filter
+        expression: "order_id is not None"
+
+      - type: derive
+        column: line_total
+        expression: "round(quantity * unit_price * (1 - discount), 2)"
+        on_error: "null"                 # a null line_total is caught by validation
+
+      - type: convert_timezone
+        columns: [order_date]
+        from: "+02:00"
+        to: UTC
+
+      # 4. PII is removed before the load, so plaintext never reaches the
+      #    warehouse. hash_columns keeps joins working; mask_pii does not.
+      - type: hash_columns
+        columns: [customer_id]
+        key: env:IRONFLOW_HASH_KEY       # keyed HMAC: not brute-forceable
+        target_suffix: _token
+        keep_original: false
+
+      - type: mask_pii
+        columns: [customer_email]
+        strategy: email
+
+      # 5. Lineage last, so the stamps describe the finished record.
+      - type: add_metadata
+        include: [execution_id, pipeline_id, loaded_at]
+
+    validation:
+      on_violation: quarantine           # keep bad rows for analysis, do not drop them
+      max_error_rate: 0.05               # abort if more than 5% are rejected
+      rules:
+        - { type: not_null, field: order_id }
+        - { type: unique,   field: order_id }
+        - { type: not_null, field: order_date }
+        - type: range
+          field: line_total
+          min: 0
+          message: "line total cannot be negative"
+        - type: in_set
+          field: currency
+          values: [EUR, USD, GBP]
+          severity: warning              # report, do not reject
+        - type: expression
+          expression: "quantity > 0 and quantity <= 10000"
+          message: "implausible order quantity"
+
+    destination:
+      type: parquet
+      path: "${var.curated}/orders.parquet"
+      mode: overwrite
+      compression: snappy
+
+    reject_destination:
+      type: csv
+      path: "${var.curated}/orders_rejected.csv"
+      mode: overwrite
+
+  # --------------------------------------------------------------- summary
+  - name: regional_summary
+    description: Aggregate curated orders by region.
+    depends_on: [load_orders]
+    # Skipped automatically when the upstream task produced nothing.
+    condition: "state.load_orders.rows_out > 0"
+
+    source:
+      type: parquet
+      path: "${var.curated}/orders.parquet"
+
+    transformations:
+      - type: aggregate
+        group_by: [region]
+        aggregations:
+          revenue:      { column: line_total, function: sum }
+          orders:       { column: order_id,   function: count }
+          customers:    { column: customer_id_token, function: count_distinct }
+          avg_order:    { column: line_total, function: avg }
+      - type: derive
+        column: revenue
+        expression: "round(revenue, 2)"
+
+    destination:
+      type: json
+      path: "${var.curated}/regional_summary.jsonl"
+      mode: overwrite
+
+# Uncomment to run unattended. Note the validate warning if you schedule a
+# pipeline without notifications - a 03:00 failure would go unnoticed.
+# schedule:
+#   cron: "0 2 * * *"
+#   timezone: Europe/Amsterdam
+#   max_concurrent_runs: 1
+#
+# notifications:
+#   - type: slack
+#     target: env:SLACK_WEBHOOK_URL
+#     on: [failed, partial]
+
+profiles:
+  production:
+    defaults:
+      batch_size: 50000
+    max_parallel_tasks: 8

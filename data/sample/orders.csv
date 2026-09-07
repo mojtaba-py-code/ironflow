@@ -1,0 +1,7 @@
+﻿Order ID,Customer ID,Customer Email,Quantity,Unit Price,Discount,Currency,Region,Order Date,Status
+1,101,alice@corp.com,2,49.99,0.1,EUR,Europe,2026-01-15,paid
+2,102,bob@corp.com,1,199.00,,USD,Americas,2026-01-16,shipped
+3,103,carol@corp.com,-5,10.00,,EUR,Europe,2026-01-17,paid
+4,104,dave@corp.com,3,25.50,0,GBP,Europe,2026-01-18,pending
+5,,eve@corp.com,1,15.00,,EUR,Europe,2026-01-19,paid
+1,101,alice@corp.com,2,49.99,0.1,EUR,Europe,2026-01-15,paid
