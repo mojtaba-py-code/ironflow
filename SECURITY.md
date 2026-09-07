@@ -13,15 +13,18 @@ Include the version, the configuration that triggers it, and a minimal
 reproduction. A pipeline YAML that demonstrates the problem is the most useful
 thing you can send.
 
-Expect an acknowledgement within 72 hours. Please give a fix a reasonable window
-before disclosing publicly.
+This is a single-maintainer project, so treat the response time as best effort
+rather than a guarantee: reports are normally acknowledged within a few days.
+Please give a fix a reasonable window before disclosing publicly.
 
 ## Supported versions
 
 | Version | Supported |
 |---|---|
-| 1.0.x | ✅ |
-| < 1.0 | ❌ |
+| 1.0.x | yes |
+| < 1.0 | no |
+
+There is no < 1.0 in the wild: 1.0.0 is the first published release.
 
 ## Scope
 

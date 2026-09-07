@@ -289,6 +289,21 @@ class TestPrivacy:
             apply(transform, [{"email": "a@b.com"}, {"email": "c@d.com"}], context)
         assert caplog.text.count("without a key") == 1
 
+    def test_a_weak_digest_is_rejected_when_the_transformation_is_built(self):
+        """Built, not applied - so `ironflow pipeline validate` catches it.
+
+        The algorithm is static configuration. Checking it only inside
+        `transform_record` meant `validate` said VALID and the run then died on
+        the first record, which is the opposite of what a pre-flight check is
+        for.
+        """
+        with pytest.raises(ConfigurationError, match="not allowed"):
+            build("hash_columns", columns=["email"], algorithm="md5")
+
+    def test_a_strong_digest_is_accepted(self, context):
+        transform = build("hash_columns", columns=["email"], algorithm="sha512")
+        assert len(apply(transform, [{"email": "a@b.com"}], context)[0]["email"]) == 128
+
     def test_hash_can_keep_the_original(self, context):
         transform = build("hash_columns", columns=["email"], keep_original=True)
         result = apply(transform, [{"email": "a@b.com"}], context)[0]

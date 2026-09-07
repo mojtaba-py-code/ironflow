@@ -27,7 +27,19 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from ironflow.core.errors import ConfigurationError
+
 REDACTED = "***REDACTED***"
+
+#: Digests permitted for pseudonymisation. All are collision-resistant and
+#: fixed-length. MD5 and SHA-1 are excluded because a pipeline that asks for one
+#: is almost always copying an old example rather than making an informed
+#: choice, and this is the one function whose whole purpose is to be
+#: irreversible. The variable-length SHAKE family is excluded because it needs a
+#: length argument that this signature has nowhere to put.
+ALLOWED_HASH_ALGORITHMS: frozenset[str] = frozenset(
+    {"sha256", "sha384", "sha512", "sha3_256", "sha3_384", "sha3_512", "blake2b", "blake2s"}
+)
 
 #: Key names whose values must never reach a log or a report.
 SENSITIVE_KEY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -151,7 +163,17 @@ def hash_value(value: Any, *, key: str | bytes | None = None, algorithm: str = "
     With ``key`` the result is an HMAC (recommended - resistant to dictionary
     attacks).  Without a key it degrades to a plain digest, which is acceptable
     only for high-entropy inputs such as UUIDs.
+
+    ``algorithm`` is checked against :data:`ALLOWED_HASH_ALGORITHMS` rather than
+    passed straight to :mod:`hashlib`.  A pipeline file asking for ``md5`` would
+    otherwise get MD5 tokens silently, in the one operation whose entire purpose
+    is that the original cannot be recovered.
     """
+    if algorithm not in ALLOWED_HASH_ALGORITHMS:
+        raise ConfigurationError(
+            "hash algorithm is not allowed for pseudonymisation",
+            context={"algorithm": algorithm, "allowed": sorted(ALLOWED_HASH_ALGORITHMS)},
+        )
     payload = str(value).encode("utf-8")
     if key is None:
         return hashlib.new(algorithm, payload).hexdigest()
@@ -242,6 +264,7 @@ def detect_pii_columns(records: Iterable[Mapping[str, Any]], sample: int = 100) 
 
 
 __all__ = [
+    "ALLOWED_HASH_ALGORITHMS",
     "REDACTED",
     "detect_pii_columns",
     "hash_value",

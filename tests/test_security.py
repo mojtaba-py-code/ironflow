@@ -35,6 +35,7 @@ from ironflow.security.guards import (
     validate_url,
 )
 from ironflow.security.masking import (
+    ALLOWED_HASH_ALGORITHMS,
     REDACTED,
     detect_pii_columns,
     hash_value,
@@ -246,6 +247,21 @@ class TestMasking:
 
     def test_unkeyed_hash_differs_from_keyed(self):
         assert hash_value("x") != hash_value("x", key="k")
+
+    @pytest.mark.parametrize("algorithm", ["md5", "sha1", "shake_128", "nonsense"])
+    def test_a_broken_digest_is_refused(self, algorithm):
+        """This is the one function whose whole purpose is irreversibility.
+
+        `hashlib.new` accepts "md5" happily, so a pipeline file copied from an
+        old example would pseudonymise PII with a broken hash and say nothing.
+        """
+        with pytest.raises(ConfigurationError, match="not allowed"):
+            hash_value("a@b.com", key="k", algorithm=algorithm)
+
+    @pytest.mark.parametrize("algorithm", sorted(ALLOWED_HASH_ALGORITHMS))
+    def test_every_allowed_digest_works_keyed_and_unkeyed(self, algorithm):
+        assert len(hash_value("a@b.com", algorithm=algorithm)) >= 64
+        assert len(hash_value("a@b.com", key="k", algorithm=algorithm)) >= 64
 
     def test_redact_url_removes_the_password_only(self):
         redacted = redact_url("postgresql://user:hunter2@db.internal:5432/prod")

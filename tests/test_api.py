@@ -135,6 +135,23 @@ class TestUnauthenticated:
         assert client.get(f"/api/runs/{execution_id}").status_code == 200
         assert client.get("/api/runs/nope").status_code == 404
 
+    def test_the_returned_execution_id_addresses_the_run(self, client):
+        """202 hands the client an id; that id has to be the run's own.
+
+        The endpoint minted an id for the response and let the runner invent a
+        different one, so `GET /api/runs/{id}` answered 404 forever and the
+        documented "poll the run endpoint" workflow could not work. The older
+        test above missed it because it read the id back out of the history
+        rather than using the one the client was given.
+        """
+        accepted = client.post("/api/pipelines/demo/runs", json={})
+        execution_id = accepted.json()["execution_id"]
+
+        detail = client.get(f"/api/runs/{execution_id}")
+        assert detail.status_code == 200, "the id returned by POST must be pollable"
+        assert detail.json()["execution_id"] == execution_id
+        assert detail.json()["trigger"] == "api"
+
     def test_invalid_status_filter(self, client):
         assert client.get("/api/runs", params={"status": "sideways"}).status_code == 400
 

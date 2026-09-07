@@ -246,6 +246,9 @@ def _register_routes(api: FastAPI) -> None:
                     only=body.only or None,
                     principal=principal,
                     trigger="api",
+                    # The same id this response already returned, so the client
+                    # can actually poll /api/runs/{execution_id} for it.
+                    execution_id=execution_id,
                     install_signal_handlers=False,
                 )
             except IronFlowError:

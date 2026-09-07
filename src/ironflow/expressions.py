@@ -24,8 +24,11 @@ time, before any evaluation happens.  The design consequences:
 * **Calls only to a fixed function table.**  The callee must be a bare name
   present in :data:`SAFE_FUNCTIONS`; ``getattr``, ``eval``, ``open`` and friends
   are simply absent.
-* **Bounded cost.**  Expression length, AST node count and string-multiplication
-  results are capped, so ``"a" * 10**9`` cannot exhaust memory.
+* **Bounded cost.**  Expression length, AST node count, sequence-multiplication
+  results and the size of anything a power produces are all capped, so neither
+  ``"a" * 10**9`` nor ``pow(2, 5_000_000)`` can exhaust memory.  The power bound
+  measures the *result*, not the exponent, so ``1.05 ** 240`` - compound interest
+  over twenty years - is still an ordinary calculation.
 
 Compiled expressions are cached, so evaluating a rule over a million rows parses
 once.
@@ -47,6 +50,11 @@ from ironflow.core.errors import ConfigurationError, TransformationError
 MAX_EXPRESSION_LENGTH: Final = 2000
 MAX_AST_NODES: Final = 400
 MAX_SEQUENCE_RESULT: Final = 1_000_000
+#: Bit length a power may produce. 4096 bits is a 1233-digit integer: past any
+#: value an ETL column plausibly holds, and deliberately below CPython's own
+#: 4300-digit int-to-str limit, so a number this evaluator permits can still be
+#: written to a CSV or a JSON document rather than failing later at the sink.
+MAX_POWER_RESULT_BITS: Final = 4096
 
 _BIN_OPS: Final[dict[type[ast.operator], Callable[[Any, Any], Any]]] = {
     ast.Add: operator.add,
@@ -188,15 +196,18 @@ def _days_between(later: Any, earlier: Any) -> int | None:
 
 
 def _safe_pow(base: Any, exponent: Any) -> Any:
-    """``pow()`` under the same bound the ``**`` operator already carries.
+    """``pow()`` under the same bound the ``**`` operator carries.
 
-    The interpreter rejects a huge exponent on an :class:`ast.Pow` node, but the
-    function table was a second, unguarded route to the identical computation:
-    ``pow(2, 5_000_000)`` builds a five-million-bit integer in under a second and
-    a slightly larger exponent exhausts memory.  Both doors need the same lock.
+    The function table was a second, unguarded route to the identical
+    computation: the interpreter sized the result of an :class:`ast.Pow` node,
+    while ``pow(2, 5_000_000)`` went straight through and built a
+    five-million-bit integer in under a second.
     """
     if _is_huge_power(base, exponent):
-        raise TransformationError("exponent is too large")
+        raise TransformationError(
+            "exponent produces a number larger than the size limit",
+            context={"limit_bits": MAX_POWER_RESULT_BITS},
+        )
     return pow(base, exponent)
 
 
@@ -352,7 +363,18 @@ class SafeExpression:
             raise
         except ZeroDivisionError:
             return None  # SQL semantics: division by zero yields NULL, not a crash
-        except (TypeError, ValueError, KeyError, IndexError, AttributeError) as exc:
+        # OverflowError is in the list because arithmetic can reach it without
+        # tripping the power guard - `(1/3) ** -10_000_000` is a float that grows
+        # rather than an integer that does. Letting it escape would abort the
+        # whole run instead of routing the record to the `on_error` policy.
+        except (
+            TypeError,
+            ValueError,
+            KeyError,
+            IndexError,
+            AttributeError,
+            OverflowError,
+        ) as exc:
             raise TransformationError(
                 "expression evaluation failed",
                 context={"expression": self.source[:120], "detail": str(exc)[:200]},
@@ -375,7 +397,10 @@ class SafeExpression:
             left = self._eval(node.left, scope)
             right = self._eval(node.right, scope)
             if isinstance(node.op, ast.Pow) and _is_huge_power(left, right):
-                raise TransformationError("exponent is too large")
+                raise TransformationError(
+                    "exponent produces a number larger than the size limit",
+                    context={"limit_bits": MAX_POWER_RESULT_BITS},
+                )
             _check_operand_types(node.op, left, right)
             return _safe_mul_guard(func(left, right))
 
@@ -515,10 +540,30 @@ def _check_operand_types(op: ast.operator, left: Any, right: Any) -> None:
 
 
 def _is_huge_power(base: Any, exponent: Any) -> bool:
+    """True when ``base ** exponent`` would build an absurdly large number.
+
+    Capping the *exponent* is the obvious guard and the wrong one: it also
+    rejects ``1.05 ** 240``, which is twenty years of monthly compound interest
+    and an entirely ordinary thing to write in a derived column.  Sizing the
+    *result* keeps that working and still rejects ``2 ** 10_000_000``, because
+    ``exponent * log2(|base|)`` is the bit length of the answer and can be
+    computed without building it.
+
+    A magnitude of one or less cannot grow, and a negative exponent yields a
+    float that underflows towards zero rather than a large integer, so neither
+    needs a bound.
+    """
     try:
-        return abs(float(exponent)) > 64 and abs(float(base)) > 1
-    except (TypeError, ValueError):
+        magnitude = abs(float(base))
+        power = float(exponent)
+    except (TypeError, ValueError, OverflowError):
         return False
+    if power <= 0 or magnitude <= 1.0:
+        return False
+    try:
+        return power * math.log2(magnitude) > MAX_POWER_RESULT_BITS
+    except (ValueError, OverflowError):  # pragma: no cover - defensive
+        return True
 
 
 # --------------------------------------------------------------------------- #

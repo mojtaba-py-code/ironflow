@@ -106,6 +106,40 @@ class TestResourceLimits:
     def test_ordinary_pow_calls_still_work(self):
         assert evaluate("pow(2, 10)", {}) == 1024
 
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            # Twenty years of monthly compound interest. Capping the exponent
+            # rather than the result rejected this, which is a data-engineering
+            # calculation, not an attack.
+            ("1.05 ** 240", 121739.57374223076),
+            ("pow(1.05, 240)", 121739.57374223076),
+            ("1.0001 ** 100", 1.0100496620928754),
+        ],
+    )
+    def test_a_large_exponent_on_a_small_base_is_not_a_bomb(self, expression, expected):
+        assert evaluate(expression, {}) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("expression", ["10 ** 100", "2 ** 128", "2 ** 4095"])
+    def test_large_but_serialisable_integers_are_allowed(self, expression):
+        """The budget sits below CPython's int-to-str limit deliberately.
+
+        A value this evaluator permits has to survive being written to a CSV or
+        a JSON document; one that cannot be converted to text would fail at the
+        sink instead, long after the expression that produced it.
+        """
+        assert len(str(evaluate(expression, {}))) < 4300
+
+    def test_overflow_follows_the_error_policy_instead_of_aborting(self):
+        """`(1/3) ** -10_000_000` is a float that grows, not an integer.
+
+        It slips past the power guard and raises OverflowError, which used to
+        escape `evaluate` untranslated and kill the run rather than routing the
+        record to `on_error`.
+        """
+        with pytest.raises(TransformationError, match="evaluation failed"):
+            evaluate("(1/3) ** -10000000", {})
+
 
 class TestEvaluation:
     @pytest.mark.parametrize(

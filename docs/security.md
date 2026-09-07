@@ -201,6 +201,14 @@ email address, a phone number, a national id — that is trivially reversed by
 enumeration, so a keyed HMAC is strongly recommended and the connector warns once
 per run when the key is missing.
 
+The `algorithm` option is checked against an allow-list — `sha256` (default),
+`sha384`, `sha512`, the SHA-3 family, `blake2b` and `blake2s` — rather than being
+passed to `hashlib` as written. `hashlib` accepts `md5` without complaint, and a
+pipeline copied from an older example would then pseudonymise PII with a broken
+hash and say nothing about it. The check runs when the transformation is built,
+so `ironflow pipeline validate` rejects it before a run rather than failing on
+the first record.
+
 `ironflow pipeline validate` runs a conservative PII detector over a sample and
 reports columns that look like email addresses, card numbers (Luhn-checked), IPs
 or phone numbers, so undeclared PII surfaces before the first production run.

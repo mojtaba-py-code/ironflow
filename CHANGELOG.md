@@ -71,9 +71,14 @@ First stable release.
   with an empty key is still a valid HMAC, so an unkeyed staging deployment
   would verify an `admin` token the caller signed themselves. `issue_token` and
   `verify_token` refuse an empty secret independently.
-- The expression evaluator bounds `pow()` the same way it bounds `**`:
-  `pow(2, 5_000_000)` builds a five-million-bit integer in under a second, so the
-  function table needed the same lock as the operator.
+- The expression evaluator bounds `pow()` the same way it bounds `**`, and both
+  bound the *result* rather than the exponent. Capping the exponent alone
+  rejected `1.05 ** 240` — twenty years of monthly compound interest — while
+  `pow(2, 5_000_000)` walked straight past the operator guard.
+- `hash_columns` accepts only collision-resistant fixed-length digests.
+  `hashlib.new("md5", ...)` succeeds silently, which in the one operation whose
+  purpose is irreversibility is the wrong default. Rejected when the
+  transformation is built, so `pipeline validate` catches it.
 
 ### Observability
 
@@ -98,6 +103,10 @@ First stable release.
   contains characters the ANSI code page cannot encode, which made
   `ironflow pipeline run x > run.log` fail *after* a successful load.
 - Optional FastAPI REST API, server-rendered dashboard and `/metrics` endpoint.
+  The `202` from a run trigger returns the id the run actually executes under,
+  so `GET /api/runs/{execution_id}` resolves; the endpoint used to mint an id
+  for the response and let the runner invent a different one, which made every
+  poll a 404.
 - Self-contained HTML and JSON run reports.
 
 ### Notable design decisions
@@ -118,7 +127,7 @@ First stable release.
 
 ### Quality
 
-- 979 tests, 90 % branch coverage, enforced by a CI floor of 88 %.
+- 1001 tests, 90 % branch coverage, enforced by a CI floor of 88 %.
 - `ruff check`, `ruff format --check` and `mypy` clean.
 - CI matrix over Python 3.11/3.12 on Linux and Windows, plus a slim-install job,
   a PostgreSQL integration job, a dependency audit, a committed-secret scan and

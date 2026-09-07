@@ -201,9 +201,16 @@ class PipelineService:
         resume_execution_id: str | None = None,
         principal: Principal | None = None,
         trigger: str = "manual",
+        execution_id: str | None = None,
         install_signal_handlers: bool = True,
     ) -> PipelineResult:
-        """Authorise, wire notifications and execute the pipeline."""
+        """Authorise, wire notifications and execute the pipeline.
+
+        ``execution_id`` lets a caller that has already published an id - the
+        REST API returns one with its ``202`` so the client can poll - run under
+        that id instead of one the runner invents. Without it the id handed to
+        the client addressed nothing and every poll returned 404.
+        """
         self.access.authorize(
             principal or Principal.system(), Permission.PIPELINE_RUN, pipeline=pipeline.name
         )
@@ -220,6 +227,7 @@ class PipelineService:
                 resume_execution_id=resume_execution_id,
                 principal=principal,
                 trigger=trigger,
+                execution_id=execution_id,
                 install_signal_handlers=install_signal_handlers,
             )
         finally:

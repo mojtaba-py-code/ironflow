@@ -26,6 +26,7 @@ from ironflow.core.errors import ConfigurationError, TransformationError
 from ironflow.core.types import FieldType, Record, RecordBatch
 from ironflow.expressions import compile_expression, record_scope
 from ironflow.security.masking import (
+    ALLOWED_HASH_ALGORITHMS,
     hash_value,
     mask,
     mask_auto,
@@ -830,6 +831,18 @@ class HashColumns(RecordTransformation):
         self._columns = self.list_option("columns", required=True)
         self._key = self.option("key")
         self._algorithm = self.str_option("algorithm", "sha256")
+        # Checked here rather than at the first record: the algorithm is static
+        # configuration, so `ironflow pipeline validate` should reject it before
+        # a run starts instead of failing halfway through one.
+        if self._algorithm not in ALLOWED_HASH_ALGORITHMS:
+            raise ConfigurationError(
+                "hash algorithm is not allowed for pseudonymisation",
+                context={
+                    "transformation": self.name,
+                    "algorithm": self._algorithm,
+                    "allowed": sorted(ALLOWED_HASH_ALGORITHMS),
+                },
+            )
         self._suffix = self.str_option("target_suffix", "")
         self._keep = self.bool_option("keep_original", False)
         self._resolved_key: str | None = None

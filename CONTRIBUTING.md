@@ -60,8 +60,8 @@ saves the next reader an hour.
 `docs/developer-guide.md` walks through adding a connector, a transformation or
 a validation rule. The short version: subclass the base, register it with the
 decorator, read options through the typed `*_option` helpers (they give
-consistent errors and route secrets through the resolver), and add the component
-to the table in `README.md`.
+consistent errors and route secrets through the resolver), and add it to the
+component lists in `README.md`.
 
 Three rules that are not negotiable:
 
