@@ -1,0 +1,28 @@
+# The build context is the repository root (`docker build -f docker/Dockerfile .`),
+# and everything in it is uploaded to the Docker daemon before the first
+# instruction runs - whether or not the Dockerfile ever COPYs it.
+#
+# That matters twice over here. A local checkout accumulates .mypy_cache,
+# htmlcov and a .venv, which is tens to hundreds of megabytes of nothing; and it
+# accumulates .ironflow/state.db, data/curated/ and logs/, which is run history
+# and processed data. Against a remote or CI daemon that data leaves the machine
+# for no reason at all.
+#
+# So this file denies everything and then re-admits exactly what the Dockerfile
+# copies. It fails closed, which is the same posture the rest of the platform
+# takes: adding a COPY to the Dockerfile means adding its exception below, and
+# forgetting to breaks the build loudly instead of shipping something silently.
+
+*
+
+!pyproject.toml
+!README.md
+!LICENSE
+!src/
+
+# Re-excluded inside the tree admitted above: build metadata and bytecode from
+# the host would otherwise be baked into the wheel and the image layer, and a
+# host-built .egg-info can shadow the one the image builds for itself.
+src/**/__pycache__/
+src/**/*.py[cod]
+src/*.egg-info/

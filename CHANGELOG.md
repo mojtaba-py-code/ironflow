@@ -146,5 +146,9 @@ First stable release.
 - CI matrix over Python 3.11/3.12 on Linux and Windows, plus a slim-install job,
   a PostgreSQL integration job, a dependency audit, a committed-secret scan and
   a container build.
+- The container build context is an allow-list: without a `.dockerignore` every
+  local checkout uploaded its `.mypy_cache`, its `.venv` and - the part that
+  matters - `.ironflow/state.db`, `logs/` and `data/curated/`, which is run
+  history and processed data, to the Docker daemon on every build.
 
 [1.0.0]: https://github.com/mojtaba-py-code/ironflow/releases/tag/v1.0.0
