@@ -204,8 +204,9 @@ class Aggregate(_MaterialisingTransformation):
 
     Memory: one accumulator per group, *not* one row per input row - so a
     100-million-row table grouped into 500 keys is cheap.  Only
-    ``count_distinct``, ``list`` and ``concat`` retain per-row data, and each
-    caps what it keeps.
+    ``count_distinct``, ``list`` and ``concat`` retain per-row data, and each is
+    bounded - by raising when the bound is reached, never by quietly returning a
+    truncated answer.
     """
 
     def __init__(self, spec: TransformSpec) -> None:
@@ -367,6 +368,16 @@ class _Edge(_Accumulator):
 
 
 class _CountDistinct(_Accumulator):
+    """Exact distinct count, bounded by :attr:`LIMIT`.
+
+    Reaching the bound raises instead of capping the number returned.  Answering
+    ``1000000`` for a group that holds more distinct values would be a wrong
+    number that looks entirely right, landing in the warehouse with nothing to
+    mark it - the same failure this codebase refuses when it declines to
+    evaluate ``"12.50" * 2``.  A loud stop names the column and the operator can
+    push the aggregation into the source query.
+    """
+
     __slots__ = ("_seen",)
     LIMIT = 1_000_000
 
@@ -374,14 +385,31 @@ class _CountDistinct(_Accumulator):
         self._seen: set[Any] = set()
 
     def add(self, value: Any) -> None:
-        if value is not None and len(self._seen) < self.LIMIT:
-            self._seen.add(str(value))
+        if value is None:
+            return
+        token = str(value)
+        if token in self._seen:
+            return
+        if len(self._seen) >= self.LIMIT:
+            raise TransformationError(
+                "count_distinct exceeded its cardinality limit; aggregate this "
+                "column in the source query instead",
+                context={"limit": self.LIMIT},
+            )
+        self._seen.add(token)
 
     def value(self) -> int:
         return len(self._seen)
 
 
 class _Collect(_Accumulator):
+    """Backs the ``list`` and ``concat`` aggregates, bounded by :attr:`LIMIT`.
+
+    Like :class:`_CountDistinct` this raises rather than truncating: a list that
+    silently stops at ten thousand elements is indistinguishable downstream from
+    a group that genuinely had ten thousand.
+    """
+
     __slots__ = ("_items", "_join")
     LIMIT = 10_000
 
@@ -390,8 +418,15 @@ class _Collect(_Accumulator):
         self._join = join
 
     def add(self, value: Any) -> None:
-        if value is not None and len(self._items) < self.LIMIT:
-            self._items.append(value)
+        if value is None:
+            return
+        if len(self._items) >= self.LIMIT:
+            raise TransformationError(
+                "list/concat aggregate exceeded its element limit; narrow the "
+                "group_by or aggregate this column in the source query",
+                context={"limit": self.LIMIT},
+            )
+        self._items.append(value)
 
     def value(self) -> Any:
         if self._join is not None:

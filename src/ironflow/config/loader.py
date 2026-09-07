@@ -384,14 +384,41 @@ class PipelineRepository:
         return spec
 
     def get(self, name: str, *, profile: str | None = None) -> PipelineSpec:
-        """Look a pipeline up by its declared ``name``."""
+        """Look a pipeline up by its declared ``name``.
+
+        A file that will not load is *not* silently skipped here the way it is
+        in :meth:`load_all`.  One mistyped key used to surface as "no pipeline
+        named 'sales' was found", which sends an operator hunting for a missing
+        file instead of at the typo on line four - and the CLI then suggests
+        ``config init``, which would scaffold straight over the file they are
+        trying to fix.
+        """
+        failures: list[tuple[Path, ConfigurationError]] = []
         for file in self.discover():
             try:
                 spec = self.load(file, profile=profile)
-            except ConfigurationError:
+            except ConfigurationError as exc:
+                failures.append((file, exc))
                 continue
             if spec.name == name:
                 return spec
+
+        # A file named after the pipeline that would not load is almost always
+        # the one being asked for, so report why it failed rather than denying
+        # it exists.
+        for file, failure in failures:
+            if file.stem == name:
+                raise failure
+
+        if failures:
+            raise ConfigurationError(
+                f"no pipeline named {name!r} was found; "
+                f"{len(failures)} file(s) here could not be loaded",
+                context={
+                    "directory": str(self.directory),
+                    "unloadable": [f.name for f, _ in failures],
+                },
+            )
         raise ConfigurationError(
             f"no pipeline named {name!r} was found",
             context={"directory": str(self.directory)},

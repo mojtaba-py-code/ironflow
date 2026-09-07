@@ -345,6 +345,30 @@ class TestPipelineRepository:
         assert [s.name for s in specs] == ["demo"]
         assert "bad.yaml" in caplog.text
 
+    def test_a_typo_reports_the_typo_not_a_missing_pipeline(self, tmp_path: Path):
+        """One bad key used to surface as "no pipeline named 'demo' was found".
+
+        That sends an operator looking for a file that is sitting right there,
+        and the CLI then suggests `config init`, which would scaffold over it.
+        """
+        write(tmp_path / "demo.yaml", {**MINIMAL, "versionn": "1"})
+        with pytest.raises(ConfigurationError, match="failed validation") as caught:
+            PipelineRepository(tmp_path).get("demo")
+        assert "versionn" in str(caught.value)
+
+    def test_an_absent_pipeline_still_says_not_found_but_names_what_would_not_load(
+        self, tmp_path: Path
+    ):
+        write(tmp_path / "broken.yaml", {**MINIMAL, "versionn": "1"})
+        with pytest.raises(ConfigurationError, match="no pipeline named") as caught:
+            PipelineRepository(tmp_path).get("ghost")
+        assert "broken.yaml" in str(caught.value)
+
+    def test_a_valid_neighbour_is_still_found_when_another_file_is_broken(self, tmp_path: Path):
+        write(tmp_path / "good.yaml", MINIMAL)
+        (tmp_path / "bad.yaml").write_text("name: [broken", encoding="utf-8")
+        assert PipelineRepository(tmp_path).get("demo").name == "demo"
+
     def test_relative_directory_does_not_double_join(self, tmp_path: Path, monkeypatch):
         """Regression: discover() returning relative paths broke load()."""
         monkeypatch.chdir(tmp_path)

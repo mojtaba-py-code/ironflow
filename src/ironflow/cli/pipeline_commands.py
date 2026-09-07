@@ -100,7 +100,18 @@ def list_pipelines(ctx: typer.Context) -> None:
             "[green]yes[/green]" if item["enabled"] else "[red]no[/red]",
         )
     if not payload:
-        cli.info("[yellow]No pipelines found.[/yellow] Try 'ironflow config init'.")
+        # "Try config init" is the right advice for an empty directory and the
+        # worst possible advice when the files are there but every one of them
+        # failed to load - it would scaffold over them.
+        discovered = len(cli.service.repository.discover())
+        if discovered:
+            cli.warn(
+                f"{discovered} pipeline file(s) found but none could be loaded; "
+                "the reason for each is logged above. Run "
+                "'ironflow pipeline validate <name>' for the details."
+            )
+        else:
+            cli.info("[yellow]No pipelines found.[/yellow] Try 'ironflow config init'.")
     cli.emit(payload, table if payload else None)
 
 

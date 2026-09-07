@@ -95,6 +95,29 @@ class RedactionFilter(logging.Filter):
             elif isinstance(value, str) and "://" in value:
                 record.__dict__[key] = redact_url(value)
 
+        if record.args:
+            # Format now, then redact the result - do not rewrite the format
+            # string while arguments are still pending. `redact_url` treats
+            # everything between ":" and "@" as the password, so a placeholder
+            # sitting in that position was deleted outright:
+            # "postgres://u:%s@h" became "postgres://u:***@h", after which the
+            # record could no longer be interpolated at all. The line was
+            # dropped and a TypeError traceback went to stderr in its place.
+            #
+            # Formatting here also closes the commoner leak: a DSN is far more
+            # often passed as an argument than baked into the format string, and
+            # arguments were never scrubbed. It costs nothing - the record has
+            # passed its level check and is on its way to a handler that would
+            # format it anyway.
+            try:
+                record.msg = record.getMessage()
+            except (TypeError, ValueError):
+                # A format string that does not match its arguments is the
+                # caller's bug. Leave the record untouched so logging reports it
+                # the way it normally would.
+                return True
+            record.args = ()
+
         if isinstance(record.msg, str) and "://" in record.msg:
             record.msg = redact_url(record.msg)
         return True

@@ -38,6 +38,10 @@ First stable release.
 ### Data quality
 
 - 14 validation rules plus a compact declarative `schema:` block.
+- Bounded aggregates (`count_distinct`, `list`, `concat`) raise when they reach
+  their limit instead of returning a truncated result. Answering `1000000` for a
+  group that holds more distinct values is a wrong number that looks entirely
+  right, and it reaches the warehouse with nothing marking it.
 - Violation policies: `fail`, `quarantine` (default), `drop`, `warn`.
 - Two circuit breakers — absolute reject count and reject rate — with a
   warm-up so one bad first row cannot trip a 5 % threshold.
@@ -83,7 +87,12 @@ First stable release.
 ### Observability
 
 - Structured JSON logging with correlation/execution/pipeline/task ids and
-  automatic secret redaction on every handler.
+  automatic secret redaction on every handler. Redaction runs over the formatted
+  message and its arguments, not the format string alone: a DSN passed as an
+  argument - the commonest way to write it - was reaching disk in plaintext, and
+  a `%s` sitting inside the credential region was itself deleted by the scrub,
+  after which the record could no longer be interpolated and the line was
+  dropped in favour of a TypeError on stderr.
 - Prometheus-compatible metrics registry that also snapshots into run history,
   so a short-lived batch job records its metrics before exiting.
 - Run history, per-task breakdowns, watermarks, checkpoints and schema
@@ -111,6 +120,11 @@ First stable release.
 
 ### Notable design decisions
 
+- **A pipeline that will not load says why.** Looking one up by name used to
+  swallow the validation error and report `no pipeline named 'sales' was found`,
+  which sends an operator hunting for a file that is sitting right there - and
+  `pipeline list` then suggested `config init`, which would have scaffolded over
+  it. Both now name the real problem.
 - **Custom YAML loader.** PyYAML implements YAML 1.1, where `on`, `off`, `yes`
   and `no` are booleans. That broke the `on:` notification key and silently
   turned the ISO-3166 country code `NO` into `False`. The loader keeps only
@@ -127,7 +141,7 @@ First stable release.
 
 ### Quality
 
-- 1001 tests, 90 % branch coverage, enforced by a CI floor of 88 %.
+- 1013 tests, 90 % branch coverage, enforced by a CI floor of 88 %.
 - `ruff check`, `ruff format --check` and `mypy` clean.
 - CI matrix over Python 3.11/3.12 on Linux and Windows, plus a slim-install job,
   a PostgreSQL integration job, a dependency audit, a committed-secret scan and

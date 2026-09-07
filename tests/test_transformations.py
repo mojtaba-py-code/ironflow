@@ -9,6 +9,7 @@ from ironflow.core.errors import ConfigurationError, TransformationError
 from ironflow.core.types import RecordBatch, batched
 from ironflow.security.crypto import CryptoService, generate_key
 from ironflow.transformation.base import TRANSFORM_REGISTRY, build_transformation
+from ironflow.transformation.blocking import _Collect, _CountDistinct
 from ironflow.transformation.engine import TransformationPipeline
 
 
@@ -404,6 +405,40 @@ class TestBlocking:
             "aggregate", aggregations={"d": {"column": "v", "function": "count_distinct"}}
         )
         assert apply_stream(transform, [{"v": 1}, {"v": 1}, {"v": 2}], context)[0]["d"] == 2
+
+    def test_count_distinct_refuses_to_return_a_truncated_count(self, context, monkeypatch):
+        """A capped distinct count is a wrong number that looks right.
+
+        Returning the cap for a group that actually holds more distinct values
+        puts a plausible, unmarked, incorrect figure in the warehouse - the same
+        failure the expression evaluator refuses when it declines to concatenate
+        `"12.50" * 2`. The group cap above already raises; these did not.
+        """
+        monkeypatch.setattr(_CountDistinct, "LIMIT", 3)
+        transform = build(
+            "aggregate", aggregations={"d": {"column": "v", "function": "count_distinct"}}
+        )
+        with pytest.raises(TransformationError, match="cardinality limit"):
+            apply_stream(transform, [{"v": i} for i in range(5)], context)
+
+    def test_count_distinct_at_the_limit_is_fine_and_repeats_do_not_trip_it(
+        self, context, monkeypatch
+    ):
+        monkeypatch.setattr(_CountDistinct, "LIMIT", 3)
+        transform = build(
+            "aggregate", aggregations={"d": {"column": "v", "function": "count_distinct"}}
+        )
+        records = [{"v": 1}, {"v": 2}, {"v": 3}, {"v": 1}, {"v": 2}]
+        assert apply_stream(transform, records, context)[0]["d"] == 3
+
+    @pytest.mark.parametrize("function", ["list", "concat"])
+    def test_list_and_concat_refuse_to_return_a_truncated_value(
+        self, context, monkeypatch, function
+    ):
+        monkeypatch.setattr(_Collect, "LIMIT", 3)
+        transform = build("aggregate", aggregations={"c": {"column": "v", "function": function}})
+        with pytest.raises(TransformationError, match="element limit"):
+            apply_stream(transform, [{"v": i} for i in range(5)], context)
 
     def test_aggregate_rejects_unknown_functions(self):
         with pytest.raises(ConfigurationError, match="unknown aggregate function"):

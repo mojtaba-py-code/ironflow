@@ -7,7 +7,7 @@ destination.
 
 [![CI](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml/badge.svg)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
-[![Tests](https://img.shields.io/badge/tests-1001%20passing-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-1013%20passing-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
 [![Branch coverage](https://img.shields.io/badge/branch%20coverage-90%25-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -280,10 +280,10 @@ pip install -e ".[dev,columnar,excel,api]"
 ```
 
 ```bash
-make check     # lint + types + 1001 tests + secret scan, i.e. everything CI runs
+make check     # lint + types + 1013 tests + secret scan, i.e. everything CI runs
 ```
 
-**1001 tests, 90 % branch coverage** — and the numbers are enforced, not
+**1013 tests, 90 % branch coverage** — and the numbers are enforced, not
 asserted: CI fails the build below 88 %, runs the suite on Python 3.11 and 3.12
 across Linux and Windows, installs without the optional extras to prove the slim
 path still imports, runs the integration tests against a real PostgreSQL, audits

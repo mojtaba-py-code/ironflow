@@ -21,8 +21,8 @@ from ironflow.observability.resources import ResourceMonitor, sample_resources
 from ironflow.security.masking import REDACTED
 
 
-def make_record(message: str = "hello", **extra) -> logging.LogRecord:
-    record = logging.LogRecord("test", logging.INFO, "f.py", 1, message, None, None)
+def make_record(message: str = "hello", *, args=None, **extra) -> logging.LogRecord:
+    record = logging.LogRecord("test", logging.INFO, "f.py", 1, message, args, None)
     for key, value in extra.items():
         setattr(record, key, value)
     return record
@@ -47,6 +47,45 @@ class TestLogging:
         record = make_record("connecting to postgresql://u:hunter2@db/prod")
         RedactionFilter().filter(record)
         assert "hunter2" not in record.getMessage()
+
+    def test_a_dsn_passed_as_an_argument_is_scrubbed(self):
+        """The commonest way to write it, and the one that used to leak.
+
+        Only the format string was scrubbed, so `log.info("connect %s", dsn)`
+        put the password straight on disk.
+        """
+        record = make_record("connecting to %s", args=("postgresql://u:hunter2@db/prod",))
+        RedactionFilter().filter(record)
+        assert "hunter2" not in record.getMessage()
+
+    def test_a_placeholder_inside_the_credentials_does_not_destroy_the_record(self):
+        """`redact_url` treats everything between ":" and "@" as the password.
+
+        Rewriting the format string therefore deleted the `%s` itself -
+        "postgres://u:%s@h" became "postgres://u:***@h" - and the record could
+        no longer be interpolated, so logging dropped the line and printed a
+        TypeError to stderr instead.
+        """
+        record = make_record("connecting to postgresql://u:%s@db/prod", args=("hunter2",))
+        RedactionFilter().filter(record)
+        message = record.getMessage()  # must not raise
+        assert "hunter2" not in message
+        assert "postgresql://u:***@db/prod" in message
+
+    def test_several_arguments_are_all_considered(self):
+        record = make_record("%s -> %s", args=("start", "mysql://u:hunter2@h/db"))
+        RedactionFilter().filter(record)
+        assert "hunter2" not in record.getMessage()
+        assert record.getMessage().startswith("start -> ")
+
+    def test_a_mismatched_format_string_is_left_for_logging_to_report(self):
+        """A format string that does not match its args is the caller's bug.
+
+        The filter must not swallow it, or the real error becomes invisible.
+        """
+        record = make_record("no placeholders here", args=("extra",))
+        assert RedactionFilter().filter(record) is True
+        assert record.args == ("extra",)
 
     def test_redaction_filter_handles_nested_mappings(self):
         record = make_record(config={"nested": {"api_key": "abc"}})
@@ -108,6 +147,26 @@ class TestLogging:
         content = log_file.read_text(encoding="utf-8")
         assert "hunter2" not in content
         assert "pw@h" not in content
+
+    def test_every_way_of_logging_a_dsn_reaches_disk_scrubbed(self, tmp_path: Path):
+        """docs/security.md promises this outright, so test it end to end."""
+        log_file = tmp_path / "app.log"
+        configure_logging(level="INFO", log_file=log_file)
+        secret = "hunter2SuperSecret"
+        dsn = f"postgresql://appuser:{secret}@db.internal:5432/prod"
+        log = logging.getLogger("test")
+        log.info("connect postgresql://appuser:%s@db/prod", secret)
+        log.info("connect %s", dsn)
+        log.info("connect " + dsn)
+        log.info("cfg", extra={"password": secret})
+        log.info("%s -> %s", "start", dsn)
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        content = log_file.read_text(encoding="utf-8")
+        assert secret not in content
+        written = [line for line in content.splitlines() if line.strip()]
+        assert len(written) == 5, "a record that fails to format is a record that is lost"
 
     def test_invalid_level_falls_back_to_info(self):
         assert configure_logging(level="NOT_A_LEVEL").level == logging.INFO
