@@ -69,7 +69,9 @@ the cascade on `task_runs`).
 | `IRONFLOW_ALLOW_LITERAL_SECRETS` | `true` | Set false in production |
 | `IRONFLOW_ALLOW_PRIVATE_NETWORK` | `false` | This is the SSRF guard |
 | `IRONFLOW_AUDIT_ENABLED` | `true` | |
+| `IRONFLOW_AUDIT_FILE` | `$IRONFLOW_HOME/audit/audit.jsonl` | The hash-chained trail; put it on a volume that survives the container |
 | `IRONFLOW_HTTP_VERIFY_TLS` | `true` | Cannot be false in production |
+| `IRONFLOW_HTTP_MAX_RETRIES` | `3` | Applies to 5xx/429 and transport errors only, never to a 4xx |
 
 Run `ironflow config check` to see what a given environment is missing.
 
