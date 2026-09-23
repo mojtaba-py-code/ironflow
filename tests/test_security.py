@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -310,7 +311,20 @@ class TestPathGuards:
         "attack",
         [
             "../../../../etc/passwd",
-            "..\\..\\..\\Windows\\System32\\config\\SAM",
+            pytest.param(
+                "..\\..\\..\\Windows\\System32\\config\\SAM",
+                marks=pytest.mark.skipif(
+                    os.name != "nt",
+                    reason=(
+                        "A backslash is an ordinary filename character on "
+                        "POSIX, so this payload names one oddly-spelled file "
+                        "inside the sandbox rather than escaping it. "
+                        "resolve_within is right not to raise, and asserting "
+                        "that it does only tests which separator the runner "
+                        "happens to use."
+                    ),
+                ),
+            ),
             "data/../../outside.txt",
         ],
     )

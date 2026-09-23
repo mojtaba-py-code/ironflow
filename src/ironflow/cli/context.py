@@ -85,9 +85,22 @@ class CliContext:
         noise.
         """
         if self.json_output:
-            self.console.print_json(json.dumps(payload, default=str, ensure_ascii=False))
+            self._print_json(json.dumps(payload, default=str, ensure_ascii=False))
         elif renderable is not None:
             self.console.print(renderable)
+
+    def _print_json(self, text: str) -> None:
+        """Write machine-readable JSON, with no styling of any kind.
+
+        ``Console.print_json`` syntax-highlights, and Rich emits the colour when
+        the stream is a terminal *or* when FORCE_COLOR is set — which CI sets.
+        The result is a document wrapped in escape sequences that ``json.loads``
+        and ``jq`` both reject, so ``--json`` stopped being machine-readable in
+        exactly the environment that parses it. Nothing is styled here, markup
+        is off so a brace in a value cannot be read as a tag, and soft wrapping
+        keeps Rich from folding a long line to the terminal width.
+        """
+        self.console.print(text, markup=False, highlight=False, soft_wrap=True)
 
     def info(self, message: str) -> None:
         if not self.json_output:
@@ -100,7 +113,7 @@ class CliContext:
         """Report an error and exit with ``code``."""
         if isinstance(error, IronFlowError):
             if self.json_output:
-                self.console.print_json(json.dumps(error.to_dict(), default=str))
+                self._print_json(json.dumps(error.to_dict(), default=str))
             else:
                 self.error_console.print(f"[bold red]error:[/bold red] {error.message}")
                 for key, value in sorted(error.context.items()):
