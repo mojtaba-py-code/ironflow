@@ -1,0 +1,30 @@
+# Automated dependency updates. This project reads untrusted files and calls
+# out over HTTP on a schedule, so an unpatched parser or HTTP-client CVE is
+# reachable from the data a pipeline processes rather than only from the host.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels: ["dependencies"]
+    groups:
+      # One PR for routine bumps keeps the queue reviewable; security updates
+      # still arrive on their own.
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "ci"]
+
+  # The image is built from docker/Dockerfile, so the base image is watched
+  # there rather than at the repository root.
+  - package-ecosystem: docker
+    directory: "/docker"
+    schedule:
+      interval: weekly
+    labels: ["dependencies", "docker"]
