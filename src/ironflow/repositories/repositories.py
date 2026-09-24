@@ -23,7 +23,7 @@ from sqlalchemy.engine import CursorResult, Result
 from sqlalchemy.exc import SQLAlchemyError
 
 from ironflow.core.context import utcnow
-from ironflow.core.errors import CheckpointError, IronFlowError
+from ironflow.core.errors import CheckpointError, ConfigurationError, IronFlowError
 from ironflow.core.types import DatasetSchema, RunStatus, SchemaDiff
 from ironflow.repositories.database import Database, get_database
 from ironflow.repositories.models import (
@@ -80,6 +80,11 @@ class RunRepository(BaseRepository):
         and made resume impossible.  The existing row is reused and ``attempt``
         incremented, so history keeps one row per logical execution and still
         records that it was retried.
+
+        Only a row of the same pipeline is reused.  Taking over another
+        pipeline's row rewrote that pipeline's history - its actor, attempt and
+        outcome - with this run's, so that is refused with a
+        :class:`ConfigurationError`.
         """
         with self.db.session() as session:
             run = session.scalar(
@@ -92,6 +97,11 @@ class RunRepository(BaseRepository):
                     started_at=utcnow(),
                 )
                 session.add(run)
+            elif run.pipeline_name != pipeline_name:
+                raise ConfigurationError(
+                    "the execution id belongs to a run of another pipeline",
+                    context={"execution_id": execution_id, "pipeline": pipeline_name},
+                )
             else:
                 run.attempt += 1
                 # Clear the previous attempt's outcome so a resumed run that
@@ -451,6 +461,13 @@ class CheckpointRepository(BaseRepository):
                         execution_id=execution_id, pipeline_name=pipeline, task_name=task
                     )
                     session.add(row)
+                elif row.pipeline_name != pipeline:
+                    # Same execution id and task name, different pipeline: the
+                    # row is another pipeline's progress, not ours to overwrite.
+                    raise CheckpointError(
+                        "the checkpoint belongs to a run of another pipeline",
+                        context={"execution_id": execution_id, "task": task},
+                    )
                 row.status = status.value
                 row.rows_processed = rows_processed
                 row.last_batch = last_batch
@@ -463,16 +480,21 @@ class CheckpointRepository(BaseRepository):
                 cause=exc,
             ) from exc
 
-    def completed_tasks(self, execution_id: str) -> set[str]:
-        """Tasks already finished successfully in a previous attempt."""
+    def completed_tasks(self, execution_id: str, pipeline: str | None = None) -> set[str]:
+        """Tasks already finished successfully in a previous attempt.
+
+        Pass ``pipeline`` whenever it is known.  A checkpoint is evidence only
+        about the pipeline that wrote it: read under another pipeline's name, a
+        finished ``load`` there skipped a ``load`` here that never ran.
+        """
+        statement = select(Checkpoint).where(
+            Checkpoint.execution_id == execution_id,
+            Checkpoint.status == RunStatus.SUCCESS.value,
+        )
+        if pipeline is not None:
+            statement = statement.where(Checkpoint.pipeline_name == pipeline)
         with self.db.session() as session:
-            rows = session.scalars(
-                select(Checkpoint).where(
-                    Checkpoint.execution_id == execution_id,
-                    Checkpoint.status == RunStatus.SUCCESS.value,
-                )
-            )
-            return {row.task_name for row in rows}
+            return {row.task_name for row in session.scalars(statement)}
 
     def get(self, execution_id: str, task: str) -> dict[str, Any] | None:
         with self.db.session() as session:

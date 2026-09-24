@@ -286,11 +286,25 @@ class PipelineService:
         principal: Principal | None = None,
         profile: str | None = None,
     ) -> PipelineResult:
-        """Continue a failed execution, skipping tasks that already succeeded."""
+        """Continue a failed execution, skipping tasks that already succeeded.
+
+        The execution must be a run of ``pipeline_name``: authorisation is
+        checked against that name, so accepting any execution id let an
+        operator scoped to one pipeline rewrite another's run record and skip
+        tasks on the strength of its checkpoints.
+        """
         self.access.authorize(
             principal or Principal.system(), Permission.RUN_RETRY, pipeline=pipeline_name
         )
-        completed = self.checkpoints.completed_tasks(execution_id)
+        run = self.runs.get_run(execution_id)
+        if run is None or run["pipeline"] != pipeline_name:
+            # One answer for "no such run" and "another pipeline's run", so the
+            # error does not tell a scoped operator which ids exist elsewhere.
+            raise ConfigurationError(
+                "the execution is not a run of this pipeline",
+                context={"pipeline": pipeline_name, "execution_id": execution_id},
+            )
+        completed = self.checkpoints.completed_tasks(execution_id, pipeline=pipeline_name)
         if not completed:
             logger.warning(
                 "no checkpoints for %s; resume will behave like a full retry", execution_id

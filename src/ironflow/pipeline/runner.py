@@ -124,7 +124,9 @@ class PipelineRunner:
 
         completed: set[str] = set()
         if resume_execution_id and self.checkpoints is not None:
-            completed = self.checkpoints.completed_tasks(resume_execution_id)
+            completed = self.checkpoints.completed_tasks(
+                resume_execution_id, pipeline=pipeline.name
+            )
             if completed:
                 logger.info(
                     "resuming %s: %d task(s) already complete (%s)",
@@ -133,10 +135,11 @@ class PipelineRunner:
                     ", ".join(sorted(completed)),
                 )
 
-        restore = self._install_signal_handlers(context) if install_signal_handlers else None
-
         with context.bind(), ResourceMonitor() as resources:
             self._start_history(pipeline, context, graph, trigger, principal)
+            # Installed once the start is accepted, so a refused start cannot
+            # leave SIGINT pointing at a run that never began.
+            restore = self._install_signal_handlers(context) if install_signal_handlers else None
             self.events.emit(
                 EventType.PIPELINE_STARTED,
                 pipeline_id=pipeline.name,
@@ -351,6 +354,11 @@ class PipelineRunner:
                 tasks_total=graph.size,
                 dry_run=context.dry_run,
             )
+        except ConfigurationError:
+            # The execution id is another pipeline's run. Unlike a history
+            # outage this must stop the run: history is keyed by execution id,
+            # so carrying on would write this run's outcome over that record.
+            raise
         except IronFlowError:
             logger.warning("unable to record the start of this run", exc_info=True)
 

@@ -150,8 +150,10 @@ class TestPipelineService:
 
     def test_resume_without_checkpoints_warns(self, service, tmp_path, caplog):
         write_pipeline(tmp_path / "pipelines", "alpha")
+        service.runs.start_run(execution_id="exec_no_checkpoints", pipeline_name="alpha")
+        service.runs.finish_run("exec_no_checkpoints", status=RunStatus.FAILED, duration_seconds=0)
         with caplog.at_level("WARNING"):
-            service.resume("alpha", "exec_does_not_exist")
+            service.resume("alpha", "exec_no_checkpoints")
         assert "no checkpoints" in caplog.text
 
     def test_clean_purges_state(self, service, tmp_path):
