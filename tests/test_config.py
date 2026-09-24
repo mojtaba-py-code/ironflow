@@ -422,6 +422,7 @@ class TestSettings:
         assert "auth_enabled" in joined
         assert "encryption_key" in joined
         assert "data_roots" in joined
+        assert "pipeline_env" in joined
         assert "SQLite" in joined or "sqlite" in joined
 
     def test_hardened_production_config_passes(self, tmp_path: Path):
@@ -435,6 +436,7 @@ class TestSettings:
             data_roots=[tmp_path],
             state_database_url="postgresql+psycopg://u@h/db",
             audit_enabled=True,
+            pipeline_env=["PG*", "API_TOKEN"],
         )
         assert settings.validate_production_hardening() == []
 

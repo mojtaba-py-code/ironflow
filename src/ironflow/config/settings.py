@@ -104,11 +104,46 @@ class Settings(BaseSettings):
     audit_file: Path | None = None
     mask_pii_in_reports: bool = True
 
+    # -- what a pipeline file may read ------------------------------------- #
+    # A pipeline file is untrusted input, and both of these used to be
+    # unbounded: `${NAME}` and `env:NAME` read any variable in the process -
+    # IRONFLOW_JWT_SECRET and IRONFLOW_ENCRYPTION_KEY included - and `file:`
+    # read any file the process could open.
+    pipeline_env: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Environment variables pipeline files may read through ${NAME} and env:NAME, "
+            "as glob patterns (PG*, API_TOKEN). Empty means any variable except IronFlow's "
+            "own settings, which is refused in production."
+        ),
+    )
+    secret_file_roots: Annotated[list[Path], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Directories file: secret references may read from, e.g. /run/secrets. "
+            "Empty disables file: references."
+        ),
+    )
+
     # -- http -------------------------------------------------------------- #
     http_timeout: float = Field(default=30.0, gt=0, le=600)
     http_max_retries: int = Field(default=3, ge=0, le=10)
     http_verify_tls: bool = True
     http_max_response_bytes: int = Field(default=256 * 1024 * 1024, ge=1024)
+    http_allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "If set, the only hosts (and their subdomains) HTTP connectors, OAuth token "
+            "endpoints and webhook/Slack notifications may contact."
+        ),
+    )
+    http_private_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Private destinations pipelines may reach despite the SSRF guard: host names "
+            "or CIDR ranges. Link-local addresses (cloud metadata) are never reachable."
+        ),
+    )
 
     # -- api --------------------------------------------------------------- #
     api_host: str = "127.0.0.1"
@@ -125,7 +160,15 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return upper
 
-    @field_validator("data_roots", "api_cors_origins", mode="before")
+    @field_validator(
+        "data_roots",
+        "api_cors_origins",
+        "pipeline_env",
+        "secret_file_roots",
+        "http_allowed_hosts",
+        "http_private_hosts",
+        mode="before",
+    )
     @classmethod
     def _split_csv(cls, value: Any) -> Any:
         """Accept ``A,B,C`` from the environment as well as a JSON list.
@@ -221,6 +264,11 @@ class Settings(BaseSettings):
             problems.append("allow_private_network must be false in production")
         if not self.data_roots:
             problems.append("data_roots must confine connectors to explicit directories")
+        if not self.pipeline_env:
+            problems.append(
+                "pipeline_env (IRONFLOW_PIPELINE_ENV) must list the environment variables "
+                "pipeline files may read"
+            )
         if not self.http_verify_tls:
             problems.append("http_verify_tls must not be disabled")
         if not self.audit_enabled:

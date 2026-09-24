@@ -850,9 +850,13 @@ class HashColumns(RecordTransformation):
 
     def transform_record(self, record: Record, context: ExecutionContext) -> Record:
         if self._resolved_key is None and self._key is not None:
+            from ironflow.config.settings import get_settings
             from ironflow.security.secrets import SecretResolver
 
-            self._resolved_key = SecretResolver().reveal(self._key, name=f"{self.name}.key")
+            # The operator's policy, not a bare resolver: a bare one ignored
+            # allow_literal_secrets and could read any variable or file.
+            resolver = SecretResolver.for_pipelines(get_settings())
+            self._resolved_key = resolver.reveal(self._key, name=f"{self.name}.key")
         if self._key is None and not self._warned:
             logger.warning(
                 "hash_columns is running without a key; an unkeyed digest of a "
@@ -896,11 +900,13 @@ class EncryptColumns(RecordTransformation):
 
     def transform_record(self, record: Record, context: ExecutionContext) -> Record:
         if self._crypto is None:
+            from ironflow.config.settings import get_settings
             from ironflow.security.crypto import CryptoService
             from ironflow.security.secrets import SecretResolver
 
             if self._key_ref is not None:
-                key = SecretResolver().reveal(self._key_ref, name=f"{self.name}.key")
+                resolver = SecretResolver.for_pipelines(get_settings())
+                key = resolver.reveal(self._key_ref, name=f"{self.name}.key")
                 self._crypto = CryptoService.from_key(str(key))
             else:
                 self._crypto = CryptoService.from_env()

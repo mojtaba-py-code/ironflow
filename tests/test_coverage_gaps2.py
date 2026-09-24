@@ -5,6 +5,7 @@ from __future__ import annotations
 import ftplib
 import os
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -226,22 +227,21 @@ class TestSftpSinkFormats:
             sink.open(context)
 
 
+def answer_token_requests(connector, handler):
+    """Serve the connector's OAuth2 token request from ``handler``."""
+    connector._build_token_client = lambda: httpx.Client(transport=httpx.MockTransport(handler))
+
+
 class TestOAuth2:
     def test_token_is_fetched_and_used(self, factory, context, monkeypatch):
         monkeypatch.setenv("CID", "client-1")
         monkeypatch.setenv("CSECRET", "shhh")
         captured = {}
 
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            captured["data"] = kwargs.get("data")
-            return httpx.Response(
-                200,
-                json={"access_token": "tok-abc", "expires_in": 3600},
-                request=httpx.Request("POST", url),
-            )
-
-        monkeypatch.setattr(httpx, "post", fake_post)
+        def token_handler(request):
+            captured["url"] = str(request.url)
+            captured["data"] = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+            return httpx.Response(200, json={"access_token": "tok-abc", "expires_in": 3600})
 
         def handler(request):
             captured["auth"] = request.headers.get("authorization")
@@ -270,10 +270,12 @@ class TestOAuth2:
             return client
 
         connector._build_client = build
+        answer_token_requests(connector, token_handler)
         connector.open(context)
         list(connector.read(context))
         connector.close()
 
+        assert captured["url"] == "https://auth.example.com/token"
         assert captured["data"]["grant_type"] == "client_credentials"
         assert captured["data"]["client_id"] == "client-1"
         assert captured["data"]["scope"] == "read:data"
@@ -282,13 +284,6 @@ class TestOAuth2:
     def test_token_endpoint_rejection_is_mapped(self, factory, context, monkeypatch):
         monkeypatch.setenv("CID", "c")
         monkeypatch.setenv("CSECRET", "s")
-        monkeypatch.setattr(
-            httpx,
-            "post",
-            lambda url, **kwargs: httpx.Response(
-                401, json={"error": "invalid_client"}, request=httpx.Request("POST", url)
-            ),
-        )
         connector = factory.create_source(
             spec(
                 "rest",
@@ -299,6 +294,9 @@ class TestOAuth2:
                 client_secret="env:CSECRET",
                 allow_private_network=True,
             )
+        )
+        answer_token_requests(
+            connector, lambda request: httpx.Response(401, json={"error": "invalid_client"})
         )
         with pytest.raises(AuthenticationError, match="rejected the credentials"):
             connector.open(context)
@@ -306,13 +304,6 @@ class TestOAuth2:
     def test_token_response_without_a_token(self, factory, context, monkeypatch):
         monkeypatch.setenv("CID", "c")
         monkeypatch.setenv("CSECRET", "s")
-        monkeypatch.setattr(
-            httpx,
-            "post",
-            lambda url, **kwargs: httpx.Response(
-                200, json={"token_type": "bearer"}, request=httpx.Request("POST", url)
-            ),
-        )
         connector = factory.create_source(
             spec(
                 "rest",
@@ -323,6 +314,9 @@ class TestOAuth2:
                 client_secret="env:CSECRET",
                 allow_private_network=True,
             )
+        )
+        answer_token_requests(
+            connector, lambda request: httpx.Response(200, json={"token_type": "bearer"})
         )
         with pytest.raises(AuthenticationError, match="no access_token"):
             connector.open(context)
@@ -331,10 +325,9 @@ class TestOAuth2:
         monkeypatch.setenv("CID", "c")
         monkeypatch.setenv("CSECRET", "s")
 
-        def explode(url, **kwargs):
+        def explode(request):
             raise httpx.ConnectError("dns failure")
 
-        monkeypatch.setattr(httpx, "post", explode)
         connector = factory.create_source(
             spec(
                 "rest",
@@ -346,6 +339,7 @@ class TestOAuth2:
                 allow_private_network=True,
             )
         )
+        answer_token_requests(connector, explode)
         with pytest.raises(AuthenticationError, match="token request failed"):
             connector.open(context)
 

@@ -7,13 +7,16 @@ data load.
 
 Security notes
 --------------
-* Webhook URLs are resolved through the secret resolver and validated by the
-  SSRF guard, exactly like any other outbound HTTP call.
+* Webhook URLs are resolved through the secret resolver and checked against the
+  operator's network policy - before the request, and again at connect time
+  through the guarded client - exactly like any other outbound HTTP call.
 * Payloads are passed through :func:`redact_mapping` before sending, so a
   connection string that found its way into an error context does not get
   posted into a chat channel.
-* SMTP uses STARTTLS and refuses to send credentials over an unencrypted
-  connection.
+* SMTP uses STARTTLS with a *verified* context and refuses to send credentials
+  over an unencrypted connection.  ``starttls()`` without a context encrypts
+  but authenticates nothing: any machine in the path could present any
+  certificate and read the SMTP password.
 """
 
 from __future__ import annotations
@@ -21,16 +24,21 @@ from __future__ import annotations
 import json
 import logging
 import smtplib
+import ssl
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from email.message import EmailMessage
 from typing import Any
+
+import httpx
 
 from ironflow.config.models import NotificationSpec
 from ironflow.config.settings import Settings, get_settings
 from ironflow.core.errors import ConfigurationError
 from ironflow.core.events import Event, EventBus, EventType
-from ironflow.security.guards import validate_url
+from ironflow.security.guards import NetworkPolicy, validate_url
 from ironflow.security.masking import redact_mapping
+from ironflow.security.net import build_client
 from ironflow.security.secrets import SecretResolver
 
 logger = logging.getLogger(__name__)
@@ -48,11 +56,13 @@ class Notifier(ABC):
     """Base class for notification channels."""
 
     name: str = "notifier"
+    #: Hosts a channel may post to when the pipeline names none.
+    default_hosts: tuple[str, ...] = ()
 
     def __init__(self, spec: NotificationSpec, settings: Settings | None = None) -> None:
         self.spec = spec
         self.settings = settings or get_settings()
-        self.secrets = SecretResolver(allow_literal=self.settings.allow_literal_secrets)
+        self.secrets = SecretResolver.for_pipelines(self.settings)
 
     @abstractmethod
     def notify(self, subject: str, body: str, payload: dict[str, Any]) -> bool:
@@ -67,6 +77,31 @@ class Notifier(ABC):
             raise ConfigurationError(f"notification channel {self.spec.type!r} requires a 'target'")
         resolved = self.secrets.reveal(self.spec.target, name=f"notification.{self.spec.type}")
         return str(resolved)
+
+    def network_policy(self) -> NetworkPolicy:
+        """The operator's policy, narrowed to the channel's allowed hosts."""
+        hosts = self.option("allowed_hosts") or list(self.default_hosts) or None
+        return NetworkPolicy.from_settings(self.settings).narrowed(allowed_hosts=hosts)
+
+    def http_client(self) -> httpx.Client:
+        """A client that re-checks every connection against the policy."""
+        return build_client(
+            self.network_policy(),
+            verify=self.settings.http_verify_tls,
+            timeout=self.settings.http_timeout,
+        )
+
+    def post(self, url: str, document: Any, headers: Mapping[str, str] | None = None) -> int:
+        """POST ``document`` and return the status without reading the body.
+
+        The endpoint is chosen by a pipeline file and answers with whatever it
+        likes; nothing here needs the response, so none of it is read.
+        """
+        with (
+            self.http_client() as client,
+            client.stream("POST", url, json=document, headers=dict(headers or {})) as response,
+        ):
+            return response.status_code
 
 
 class ConsoleNotifier(Notifier):
@@ -85,10 +120,8 @@ class WebhookNotifier(Notifier):
     name = "webhook"
 
     def notify(self, subject: str, body: str, payload: dict[str, Any]) -> bool:
-        import httpx
-
         try:
-            url = validate_url(self.target(), allow_private=self.settings.allow_private_network)
+            url = validate_url(self.target(), policy=self.network_policy())
         except Exception:
             logger.error("webhook target rejected by the URL policy", exc_info=True)
             return False
@@ -101,19 +134,17 @@ class WebhookNotifier(Notifier):
             **redact_mapping(payload),
         }
         try:
-            response = httpx.post(
+            status = self.post(
                 url,
-                json=document,
-                timeout=self.settings.http_timeout,
-                verify=self.settings.http_verify_tls,
+                document,
                 headers={str(k): str(v) for k, v in (self.option("headers") or {}).items()},
             )
         except Exception:
             logger.error("webhook notification failed", exc_info=True)
             return False
 
-        if response.status_code >= 400:
-            logger.error("webhook returned HTTP %d", response.status_code)
+        if status >= 400:
+            logger.error("webhook returned HTTP %d", status)
             return False
         return True
 
@@ -122,16 +153,11 @@ class SlackNotifier(Notifier):
     """Post a Slack message via an incoming webhook."""
 
     name = "slack"
+    default_hosts = ("hooks.slack.com",)
 
     def notify(self, subject: str, body: str, payload: dict[str, Any]) -> bool:
-        import httpx
-
         try:
-            url = validate_url(
-                self.target(),
-                allow_private=self.settings.allow_private_network,
-                allowed_hosts=self.option("allowed_hosts") or ["hooks.slack.com"],
-            )
+            url = validate_url(self.target(), policy=self.network_policy())
         except Exception:
             logger.error("slack webhook rejected by the URL policy", exc_info=True)
             return False
@@ -160,16 +186,11 @@ class SlackNotifier(Notifier):
             ],
         }
         try:
-            response = httpx.post(
-                url,
-                json=document,
-                timeout=self.settings.http_timeout,
-                verify=self.settings.http_verify_tls,
-            )
+            http_status = self.post(url, document)
         except Exception:
             logger.error("slack notification failed", exc_info=True)
             return False
-        return response.status_code < 400
+        return http_status < 400
 
 
 class EmailNotifier(Notifier):
@@ -204,7 +225,10 @@ class EmailNotifier(Notifier):
         try:
             with smtplib.SMTP(host, port, timeout=30) as smtp:
                 if use_tls:
-                    smtp.starttls()
+                    # The system trust store rather than certifi's: a relay
+                    # inside a company network is usually signed by a CA the
+                    # operator installed on the host, not a public one.
+                    smtp.starttls(context=ssl.create_default_context())
                 if username and password:
                     smtp.login(username, password)
                 smtp.send_message(message)

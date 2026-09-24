@@ -264,6 +264,7 @@ class TestProductionGuard:
             # for the settings check and hand the app a SQLite-backed service.
             state_database_url="postgresql+psycopg://u@h/db",
             pipelines_dir=api_workspace / "pipelines",
+            pipeline_env=["PG*"],
         )
         settings.ensure_directories()
         assert settings.validate_production_hardening() == []

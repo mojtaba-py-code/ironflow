@@ -6,14 +6,25 @@ Security
   - is re-validated by :func:`validate_url`.  A ``next`` link pointing at
   ``http://169.254.169.254/latest/meta-data/iam/`` is the classic way an API
   integration turns into cloud credential theft; re-checking each hop closes it.
+* Every *connection* is checked too.  The client comes from
+  :mod:`ironflow.security.net`, which resolves, checks and connects in one
+  step, so a name that answers the pre-flight check with a public address and
+  the socket with a private one (DNS rebinding) is refused.
+* The network policy is the operator's.  A pipeline may narrow it -
+  ``allowed_hosts``, ``allow_private_network: false`` - and may not widen it.
 * Redirects are **not** followed automatically.  A 302 to an internal address
   bypasses a check that only ran on the original URL.  Redirects are resolved
   manually, one hop at a time, each one re-validated, with a bounded count.
 * TLS verification is on and cannot be disabled in a production environment.
 * Credentials are resolved through the secret resolver and sent as headers, so
-  they never appear in a URL, a log line or a proxy access record.
-* Response bodies are size-capped while streaming, so a hostile endpoint cannot
-  exhaust memory with an unbounded body.
+  they never appear in a URL, a log line or a proxy access record - and only to
+  the origin they were configured for.  A redirect or a ``next`` link to any
+  other host gets no ``Authorization``, API key or custom header: a hostile
+  API that answered with ``Location: https://evil.example`` used to receive
+  the bearer token on the next request.
+* Response bodies are size-capped while streaming, on the decoded bytes, so
+  neither an unbounded body nor a small gzip bomb can exhaust memory.  Error
+  bodies are read only as far as the message quotes them.
 
 Reliability
 -----------
@@ -27,11 +38,10 @@ from __future__ import annotations
 
 import json
 import logging
-import ssl
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from functools import lru_cache
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
@@ -50,34 +60,40 @@ from ironflow.core.errors import (
 from ironflow.core.errors import ConnectionError as IFConnectionError
 from ironflow.core.retry import call_with_retry
 from ironflow.core.types import Record, RecordBatch, RecordStream
-from ironflow.security.guards import validate_url
+from ironflow.security.guards import NetworkPolicy, validate_url
+from ironflow.security.net import build_client, read_capped, read_prefix
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 MAX_REDIRECTS = 5
 MAX_PAGES_DEFAULT = 10_000
+#: An OAuth2 token response is a few hundred bytes; anything past this is not one.
+MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
+
+Origin = tuple[str, str, int | None]
 
 
-@lru_cache(maxsize=2)
-def _shared_ssl_context() -> ssl.SSLContext:
-    """One verified TLS context per process.
-
-    Constructing an ``httpx.Client`` with ``verify=True`` re-reads and re-parses
-    the CA bundle every time - measured at ~1.4 s per client.  A pipeline with
-    several REST tasks paid that repeatedly for no benefit, since the trust
-    store does not change during a run.  Certificate verification and hostname
-    checking stay on; only the parsing is shared.
-    """
+def _origin(url: str) -> Origin | None:
+    """``(scheme, host, port)`` - the unit credentials are bound to."""
     try:
-        import certifi
+        parsed = urlparse(url)
+        port = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme.lower())
+    except ValueError:
+        return None
+    return parsed.scheme.lower(), (parsed.hostname or "").lower().rstrip("."), port
 
-        context = ssl.create_default_context(cafile=certifi.where())
-    except ImportError:  # pragma: no cover - falls back to the system store
-        context = ssl.create_default_context()
-    context.check_hostname = True
-    context.verify_mode = ssl.CERT_REQUIRED
-    return context
+
+@dataclass(frozen=True)
+class HttpReply:
+    """A response whose body has been read, and size-checked, in full."""
+
+    status_code: int
+    headers: httpx.Headers
+    content: bytes
+
+    def json(self) -> Any:
+        return json.loads(self.content)
 
 
 class RateLimiter:
@@ -119,6 +135,76 @@ class RateLimiter:
 class HttpClientMixin:
     """Shared authentication, request execution and response handling."""
 
+    #: Cached OAuth2 token as ``(token, expires_at)``; set by ``_oauth2_token``.
+    _token_cache: tuple[str, float] | None = None
+
+    def _init_http(self: Any) -> None:
+        """Per-connector state; runs the policy checks at construction.
+
+        Building the policy here, not at open, is what lets ``ironflow pipeline
+        validate`` report a pipeline that tries to switch the SSRF guard off.
+        """
+        self._warned_cross_origin = False
+        self._policy = self._network_policy()
+        self._credential_origin = _origin(self.str_option("url", required=True))
+
+    def _network_policy(self: Any) -> NetworkPolicy:
+        """The operator's policy, narrowed - never widened - by this connector.
+
+        ``allow_private_network: true`` in a pipeline used to *override* the
+        platform setting, production included: one line of YAML put
+        ``169.254.169.254`` back in reach.  A pipeline may now only switch
+        private addresses off; reaching an internal API is the operator's call,
+        through ``IRONFLOW_HTTP_PRIVATE_HOSTS``.
+        """
+        platform = NetworkPolicy.from_settings(self.runtime.settings)
+        requested = self.option("allow_private_network")
+        wants_private = (
+            None if requested is None else self.bool_option("allow_private_network", False)
+        )
+        if wants_private and not platform.allow_private:
+            raise ConfigurationError(
+                "a pipeline cannot switch off the SSRF guard; list the host in "
+                "IRONFLOW_HTTP_PRIVATE_HOSTS to reach an internal API",
+                context={"connector": self.name},
+            )
+        return platform.narrowed(
+            allow_private=wants_private,
+            allowed_hosts=self.list_option("allowed_hosts") or None,
+        )
+
+    def _credential_headers(self: Any) -> dict[str, str]:
+        """Authentication plus the pipeline's own ``headers``.
+
+        Both are treated as credentials: a custom header is as likely to carry a
+        token as ``Authorization`` is.
+        """
+        return {
+            **self._auth_headers(),
+            **{str(k): str(v) for k, v in (self.option("headers", {}) or {}).items()},
+        }
+
+    def _headers_for(self: Any, url: str) -> dict[str, str]:
+        """Credentials for the configured origin; nothing for any other."""
+        if _origin(url) == self._credential_origin:
+            return self._credential_headers()
+        if not self._warned_cross_origin:
+            logger.warning(
+                "not sending credentials to %s: it is not the origin they were configured for",
+                urlparse(url).hostname,
+            )
+            self._warned_cross_origin = True
+        return {}
+
+    def _verify_tls(self: Any) -> bool:
+        settings = self.runtime.settings
+        verify = bool(self.bool_option("verify_tls", settings.http_verify_tls))
+        if not verify and settings.is_production:
+            raise ConfigurationError(
+                "TLS verification cannot be disabled in a production environment"
+            )
+        return verify
+
     def _auth_headers(self: Any) -> dict[str, str]:
         """Build authentication headers from the configured scheme."""
         auth_type = self.str_option("auth", "none").lower()
@@ -152,18 +238,14 @@ class HttpClientMixin:
             )
         return headers
 
-    #: Cached OAuth2 token as ``(token, expires_at)``; set by ``_oauth2_token``.
-    _token_cache: tuple[str, float] | None = None
-
     def _oauth2_token(self: Any) -> str:
         """Client-credentials grant, cached until shortly before expiry."""
-        cached = getattr(self, "_token_cache", None)
+        cached = self._token_cache
         if cached and cached[1] > time.time() + 30:
             return str(cached[0])
 
         token_url = validate_url(
-            self.str_option("token_url", required=True),
-            allow_private=self.runtime.settings.allow_private_network,
+            self.str_option("token_url", required=True), policy=self._token_policy()
         )
         payload = {
             "grant_type": "client_credentials",
@@ -175,60 +257,70 @@ class HttpClientMixin:
             payload["scope"] = scope
 
         try:
-            response = httpx.post(
-                token_url,
-                data=payload,
-                timeout=self.runtime.settings.http_timeout,
-                verify=self.runtime.settings.http_verify_tls,
-            )
+            with (
+                self._build_token_client() as client,
+                client.stream("POST", token_url, data=payload) as response,
+            ):
+                if response.status_code != 200:
+                    raise AuthenticationError(
+                        "OAuth2 token endpoint rejected the credentials",
+                        context={"status": response.status_code},
+                    )
+                content = read_capped(response, MAX_TOKEN_RESPONSE_BYTES)
         except httpx.HTTPError as exc:
             raise AuthenticationError(
                 "OAuth2 token request failed", context={"token_url": token_url}, cause=exc
             ) from exc
+        except ExtractionError as exc:
+            raise AuthenticationError("OAuth2 token response is too large") from exc
 
-        if response.status_code != 200:
-            raise AuthenticationError(
-                "OAuth2 token endpoint rejected the credentials",
-                context={"status": response.status_code},
-            )
-        body = response.json()
-        token = body.get("access_token")
-        if not token:
+        try:
+            body = json.loads(content)
+        except ValueError as exc:
+            raise AuthenticationError("OAuth2 token response is not JSON") from exc
+        token = body.get("access_token") if isinstance(body, Mapping) else None
+        if not token or not isinstance(token, str):
             raise AuthenticationError("OAuth2 response contained no access_token")
-        expires_in = int(body.get("expires_in", 3600))
+        try:
+            expires_in = max(0, int(body.get("expires_in", 3600)))
+        except (TypeError, ValueError):
+            expires_in = 300  # unparseable: refresh soon rather than trust it
         self._token_cache = (token, time.time() + expires_in)
-        return str(token)
+        return token
+
+    def _token_policy(self: Any) -> NetworkPolicy:
+        """The token endpoint is its own origin, so the connector's
+        ``allowed_hosts`` (which names the API) does not apply to it - the
+        operator's allow-list and private-network rules still do."""
+        platform = NetworkPolicy.from_settings(self.runtime.settings)
+        return replace(self._policy, host_allowlists=platform.host_allowlists)
+
+    def _build_token_client(self: Any) -> httpx.Client:
+        return build_client(
+            self._token_policy(),
+            verify=self._verify_tls(),
+            timeout=self.runtime.settings.http_timeout,
+        )
 
     def _build_client(self: Any) -> httpx.Client:
         settings = self.runtime.settings
-        verify = self.bool_option("verify_tls", settings.http_verify_tls)
-        if not verify and settings.is_production:
-            raise ConfigurationError(
-                "TLS verification cannot be disabled in a production environment"
-            )
-        headers = {
-            "User-Agent": self.str_option("user_agent", "IronFlow/1.0"),
-            "Accept": self.str_option("accept", "application/json"),
-            **self._auth_headers(),
-            **{str(k): str(v) for k, v in (self.option("headers", {}) or {}).items()},
-        }
-        return httpx.Client(
-            headers=headers,
-            timeout=httpx.Timeout(self.int_option("timeout", int(settings.http_timeout))),
-            verify=_shared_ssl_context() if verify else False,
-            # Handled manually so every hop is re-validated against the SSRF policy.
-            follow_redirects=False,
-            limits=httpx.Limits(max_connections=self.int_option("max_connections", 10)),
+        # Credentials are attached per request (only to their own origin), but
+        # resolved here as well, so a missing secret or a rejected OAuth2 client
+        # fails at open - before a sink has accepted a single record.
+        self._auth_headers()
+        return build_client(
+            self._policy,
+            verify=self._verify_tls(),
+            timeout=float(self.int_option("timeout", int(settings.http_timeout), maximum=600)),
+            headers={
+                "User-Agent": self.str_option("user_agent", "IronFlow/1.0"),
+                "Accept": self.str_option("accept", "application/json"),
+            },
+            max_connections=self.int_option("max_connections", 10, maximum=100),
         )
 
     def _validate(self: Any, url: str) -> str:
-        return validate_url(
-            url,
-            allow_private=self.bool_option(
-                "allow_private_network", self.runtime.settings.allow_private_network
-            ),
-            allowed_hosts=self.list_option("allowed_hosts") or None,
-        )
+        return validate_url(url, policy=self._policy)
 
     def _request(
         self: Any,
@@ -239,17 +331,27 @@ class HttpClientMixin:
         params: Mapping[str, Any] | None = None,
         json_body: Any = None,
         limiter: RateLimiter | None = None,
-    ) -> httpx.Response:
+        read_body: bool = True,
+    ) -> HttpReply:
         """Execute one logical request: rate limit, retry, manual redirects."""
         policy = self.retry_policy
+        max_bytes = self.runtime.settings.http_max_response_bytes
 
-        def attempt() -> httpx.Response:
+        def attempt() -> HttpReply:
             if limiter is not None:
                 limiter.acquire()
             current = self._validate(url)
+            query = params
             for hop in range(MAX_REDIRECTS + 1):
+                request = client.build_request(
+                    method,
+                    current,
+                    params=query,
+                    json=json_body,
+                    headers=self._headers_for(current),
+                )
                 try:
-                    response = client.request(method, current, params=params, json=json_body)
+                    response = client.send(request, stream=True)
                 except httpx.TimeoutException as exc:
                     raise IFConnectionError(
                         "request timed out", context={"url": current}, cause=exc
@@ -259,15 +361,22 @@ class HttpClientMixin:
                         "request failed", context={"url": current}, cause=exc
                     ) from exc
 
-                if response.is_redirect and response.headers.get("location"):
-                    if hop >= MAX_REDIRECTS:
-                        raise IFConnectionError(
-                            "too many redirects", context={"url": current}, retryable=False
-                        )
-                    current = self._validate(urljoin(current, response.headers["location"]))
+                try:
+                    if response.is_redirect and response.headers.get("location"):
+                        if hop >= MAX_REDIRECTS:
+                            raise IFConnectionError(
+                                "too many redirects", context={"url": current}, retryable=False
+                            )
+                        current = self._validate(urljoin(current, response.headers["location"]))
+                        # The Location is a complete URL: re-appending the
+                        # original query would send it somewhere it was not meant.
+                        query = None
+                        continue
+                    _raise_for_status(response)
+                    content = read_capped(response, max_bytes) if read_body else b""
+                    return HttpReply(response.status_code, response.headers, content)
+                finally:
                     response.close()
-                    continue
-                return self._check_response(response)
 
             raise IFConnectionError(  # pragma: no cover - loop always returns
                 "redirect resolution failed", context={"url": url}
@@ -275,32 +384,33 @@ class HttpClientMixin:
 
         return call_with_retry(attempt, policy, description=f"{method} {url}")
 
-    def _check_response(self: Any, response: httpx.Response) -> httpx.Response:
-        status = response.status_code
-        if status < 400:
-            return response
 
-        body = response.text[:500]
-        if status in {401, 403}:
-            raise AuthenticationError(
-                "the API rejected our credentials",
-                context={"status": status, "body": body},
-            )
-        if status == 429:
-            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-            if retry_after:
-                logger.warning("rate limited; sleeping %.1fs as instructed", retry_after)
-                time.sleep(min(retry_after, 120))
-            raise RateLimitError("the API rate limit was exceeded", context={"status": status})
-        if status in RETRYABLE_STATUS:
-            raise IFConnectionError(
-                "the API returned a transient error",
-                context={"status": status, "body": body},
-            )
-        raise ExtractionError(
-            "the API returned an error",
+def _raise_for_status(response: httpx.Response) -> None:
+    """Map an error status to the right exception, quoting only a prefix of the body."""
+    status = response.status_code
+    if status < 400:
+        return
+    body = read_prefix(response, 500)
+    if status in {401, 403}:
+        raise AuthenticationError(
+            "the API rejected our credentials",
             context={"status": status, "body": body},
         )
+    if status == 429:
+        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+        if retry_after:
+            logger.warning("rate limited; sleeping %.1fs as instructed", retry_after)
+            time.sleep(min(retry_after, 120))
+        raise RateLimitError("the API rate limit was exceeded", context={"status": status})
+    if status in RETRYABLE_STATUS:
+        raise IFConnectionError(
+            "the API returned a transient error",
+            context={"status": status, "body": body},
+        )
+    raise ExtractionError(
+        "the API returned an error",
+        context={"status": status, "body": body},
+    )
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -335,7 +445,8 @@ class RestSource(HttpClientMixin, BaseSource):
         super().__init__(spec, runtime)
         self._client: httpx.Client | None = None
         self._limiter: RateLimiter | None = None
-        self._token_cache = None
+        self._token_cache: tuple[str, float] | None = None
+        self._init_http()
 
     def _on_open(self, context: ExecutionContext) -> None:
         self._client = self._build_client()
@@ -376,7 +487,7 @@ class RestSource(HttpClientMixin, BaseSource):
                 response = self._request(
                     self._client, method, next_url, params=page_params, limiter=self._limiter
                 )
-                payload = _parse_json(response, self.runtime.settings.http_max_response_bytes)
+                payload = _parse_json(response)
                 records = _extract_records(payload, data_path)
 
                 logger.debug(
@@ -429,7 +540,7 @@ class RestSource(HttpClientMixin, BaseSource):
         self,
         pagination: str,
         current_url: str,
-        response: httpx.Response,
+        response: HttpReply,
         payload: Any,
         records: list[Any],
         page_size: int,
@@ -457,15 +568,11 @@ class RestSource(HttpClientMixin, BaseSource):
         )
 
 
-def _parse_json(response: httpx.Response, max_bytes: int) -> Any:
-    if len(response.content) > max_bytes:
-        raise ExtractionError(
-            "response exceeds the configured size limit",
-            context={"bytes": len(response.content), "limit": max_bytes},
-        )
+def _parse_json(response: HttpReply) -> Any:
+    # The size limit was enforced while the body streamed in (`read_capped`).
     try:
         return response.json()
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (ValueError, RecursionError) as exc:  # RecursionError: absurd nesting
         raise ExtractionError(
             "response body is not valid JSON",
             context={"content_type": response.headers.get("content-type", "")},
@@ -535,7 +642,8 @@ class RestSink(HttpClientMixin, BaseSink):
         super().__init__(spec, runtime)
         self._client: httpx.Client | None = None
         self._limiter: RateLimiter | None = None
-        self._token_cache = None
+        self._token_cache: tuple[str, float] | None = None
+        self._init_http()
 
     def _on_open(self, context: ExecutionContext) -> None:
         self._client = self._build_client()
@@ -561,10 +669,24 @@ class RestSink(HttpClientMixin, BaseSink):
         if self.str_option("payload_mode", "batch") == "record":
             for record in batch.records:
                 single: Any = {wrapper: record} if wrapper else record
-                self._request(self._client, method, url, json_body=single, limiter=self._limiter)
+                self._request(
+                    self._client,
+                    method,
+                    url,
+                    json_body=single,
+                    limiter=self._limiter,
+                    read_body=False,
+                )
         else:
             whole: Any = {wrapper: batch.records} if wrapper else batch.records
-            self._request(self._client, method, url, json_body=whole, limiter=self._limiter)
+            self._request(
+                self._client,
+                method,
+                url,
+                json_body=whole,
+                limiter=self._limiter,
+                read_body=False,
+            )
 
         self.rows_written += len(batch)
         return len(batch)
@@ -594,7 +716,8 @@ class GraphQLSource(HttpClientMixin, BaseSource):
         super().__init__(spec, runtime)
         self._client: httpx.Client | None = None
         self._limiter: RateLimiter | None = None
-        self._token_cache = None
+        self._token_cache: tuple[str, float] | None = None
+        self._init_http()
 
     def _on_open(self, context: ExecutionContext) -> None:
         self._client = self._build_client()
@@ -642,7 +765,7 @@ class GraphQLSource(HttpClientMixin, BaseSource):
                     json_body={"query": query, "variables": page_variables},
                     limiter=self._limiter,
                 )
-                payload = _parse_json(response, self.runtime.settings.http_max_response_bytes)
+                payload = _parse_json(response)
 
                 # GraphQL returns HTTP 200 with an ``errors`` array; a naive
                 # status-code check would silently ingest an empty result set.

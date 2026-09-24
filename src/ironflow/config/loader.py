@@ -17,7 +17,16 @@ Features
 
 Interpolation deliberately does *not* execute anything.  It is a string
 substitution over a parsed document, so a pipeline file cannot become a code
-execution vector.
+execution vector.  It cannot become a way to read the process environment
+either: every ``${NAME}`` that reaches for it passes the operator's
+:class:`~ironflow.security.secrets.EnvironmentPolicy`.  Interpolated values land
+in ordinary fields - ``owner``, ``description``, a URL - that the API, the
+dashboard and every log line show in plaintext, so ``owner:
+"${IRONFLOW_JWT_SECRET}"`` used to publish the token-signing key.
+
+Documents are bounded before they are built: a size cap on the file, and a cap
+on how far its aliases expand.  YAML anchors are legitimate, but nine of them
+nested nine deep describe 387 million nodes in under 500 bytes.
 """
 
 from __future__ import annotations
@@ -34,8 +43,9 @@ import yaml
 from pydantic import ValidationError as PydanticValidationError
 
 from ironflow.config.models import PipelineSpec
-from ironflow.core.errors import ConfigurationError
+from ironflow.core.errors import ConfigurationError, SecretError
 from ironflow.security.guards import resolve_within
+from ironflow.security.secrets import EnvironmentPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +54,10 @@ _VAR_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_.]*)(?::-(?P<default>[^}
 
 SUPPORTED_SUFFIXES = (".yaml", ".yml", ".json")
 MAX_INCLUDE_DEPTH = 5
+#: A pipeline definition is a few kilobytes; a megabyte is two orders past any real one.
+MAX_DOCUMENT_BYTES = 1024 * 1024
+#: Nodes a document may describe once its aliases are expanded.
+MAX_DOCUMENT_NODES = 100_000
 
 #: Only these spellings become booleans. See :func:`_build_loader`.
 _STRICT_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
@@ -83,6 +97,66 @@ def _build_loader() -> type[yaml.SafeLoader]:
 IronFlowLoader = _build_loader()
 
 
+def _parse_yaml(text: str) -> Any:
+    """Compose, bound, then construct - never construct an unbounded document.
+
+    ``IronFlowLoader`` derives from ``SafeLoader``, so a crafted tag can never
+    build an arbitrary Python object; what ``SafeLoader`` does not stop is an
+    alias bomb, whose cost only appears when something walks the result.
+    """
+    loader = IronFlowLoader(text)
+    try:
+        node = loader.get_single_node()
+        if node is None:
+            return None
+        _assert_expansion_bounded(node)
+        return loader.construct_document(node)
+    finally:
+        loader.dispose()
+
+
+def _assert_expansion_bounded(root: yaml.Node) -> None:
+    """Refuse a document whose aliases expand past :data:`MAX_DOCUMENT_NODES`.
+
+    Each node's expanded size is computed once, bottom-up, so the check costs
+    the size of the *written* document however far it would expand.  An alias
+    that refers back to its own ancestor would make the document infinite and is
+    refused outright.  Iterative, so nesting depth cannot overflow the stack.
+    """
+    sizes: dict[int, int] = {}
+    visiting: set[int] = set()
+    stack: list[tuple[yaml.Node, bool]] = [(root, False)]
+    while stack:
+        node, expanded = stack.pop()
+        key = id(node)
+        children = _children(node)
+        if not expanded:
+            if key in sizes:
+                continue
+            if key in visiting:
+                raise ConfigurationError("configuration contains a recursive YAML alias")
+            visiting.add(key)
+            stack.append((node, True))
+            stack.extend((child, False) for child in children if id(child) not in sizes)
+            continue
+        total = 1 + sum(sizes[id(child)] for child in children)
+        if total > MAX_DOCUMENT_NODES:
+            raise ConfigurationError(
+                "configuration expands past the node limit; check its YAML aliases",
+                context={"limit": MAX_DOCUMENT_NODES},
+            )
+        sizes[key] = total
+        visiting.discard(key)
+
+
+def _children(node: yaml.Node) -> list[yaml.Node]:
+    if isinstance(node, yaml.SequenceNode):
+        return list(node.value)
+    if isinstance(node, yaml.MappingNode):
+        return [part for pair in node.value for part in pair]
+    return []
+
+
 def load_document(path: str | Path, *, roots: tuple[Path, ...] = ()) -> dict[str, Any]:
     """Parse a YAML/JSON file into a plain dict."""
     resolved = resolve_within(path, roots, must_exist=True)
@@ -92,25 +166,32 @@ def load_document(path: str | Path, *, roots: tuple[Path, ...] = ()) -> dict[str
             context={"path": str(resolved), "supported": list(SUPPORTED_SUFFIXES)},
         )
     try:
+        size = resolved.stat().st_size
+        if size > MAX_DOCUMENT_BYTES:
+            raise ConfigurationError(
+                "configuration file is too large",
+                context={"path": str(resolved), "bytes": size, "limit": MAX_DOCUMENT_BYTES},
+            )
         text = resolved.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ConfigurationError(
             "unable to read configuration file", context={"path": str(resolved)}
         ) from exc
 
     try:
-        # IronFlowLoader derives from SafeLoader, so a crafted tag can never
-        # construct arbitrary Python objects.
-        data = (
-            json.loads(text)
-            if resolved.suffix.lower() == ".json"
-            else yaml.load(text, Loader=IronFlowLoader)  # noqa: S506 - SafeLoader subclass
-        )
+        data = json.loads(text) if resolved.suffix.lower() == ".json" else _parse_yaml(text)
     except (yaml.YAMLError, json.JSONDecodeError) as exc:
         raise ConfigurationError(
             "configuration file is not valid YAML/JSON",
             context={"path": str(resolved), "detail": str(exc)[:300]},
         ) from exc
+    except RecursionError as exc:
+        raise ConfigurationError(
+            "configuration file is nested too deeply", context={"path": str(resolved)}
+        ) from exc
+    except ConfigurationError as exc:
+        exc.with_context(path=str(resolved))
+        raise
 
     if data is None:
         data = {}
@@ -144,27 +225,42 @@ def interpolate(
     *,
     environ: Mapping[str, str] | None = None,
     strict: bool = True,
+    env_policy: EnvironmentPolicy | None = None,
     _path: str = "",
 ) -> Any:
     """Recursively substitute ``${...}`` references inside a parsed document.
 
     Resolution order: pipeline ``variables`` (also reachable as ``var.NAME``),
-    then the process environment, then the inline ``:-default``.
+    then the process environment - through ``env_policy`` - then the inline
+    ``:-default``.
     """
     env = environ if environ is not None else os.environ
+    policy = env_policy or EnvironmentPolicy.default()
 
     if isinstance(value, str):
-        return _interpolate_string(value, variables, env, strict=strict, path=_path)
+        return _interpolate_string(value, variables, env, policy, strict=strict, path=_path)
     if isinstance(value, Mapping):
         return {
             key: interpolate(
-                item, variables, environ=env, strict=strict, _path=f"{_path}.{key}".lstrip(".")
+                item,
+                variables,
+                environ=env,
+                strict=strict,
+                env_policy=policy,
+                _path=f"{_path}.{key}".lstrip("."),
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
         return [
-            interpolate(item, variables, environ=env, strict=strict, _path=f"{_path}[{index}]")
+            interpolate(
+                item,
+                variables,
+                environ=env,
+                strict=strict,
+                env_policy=policy,
+                _path=f"{_path}[{index}]",
+            )
             for index, item in enumerate(value)
         ]
     return value
@@ -174,6 +270,7 @@ def _interpolate_string(
     text: str,
     variables: Mapping[str, Any],
     environ: Mapping[str, str],
+    policy: EnvironmentPolicy,
     *,
     strict: bool,
     path: str,
@@ -182,11 +279,11 @@ def _interpolate_string(
     if match:
         # A whole-string reference preserves the referenced value's type,
         # so ``batch_size: "${BATCH}"`` can still yield an int.
-        resolved = _lookup(match, variables, environ, strict=strict, path=path)
+        resolved = _lookup(match, variables, environ, policy, strict=strict, path=path)
         return resolved
 
     def _replace(m: re.Match[str]) -> str:
-        return str(_lookup(m, variables, environ, strict=strict, path=path))
+        return str(_lookup(m, variables, environ, policy, strict=strict, path=path))
 
     return _VAR_RE.sub(_replace, text)
 
@@ -195,6 +292,7 @@ def _lookup(
     match: re.Match[str],
     variables: Mapping[str, Any],
     environ: Mapping[str, str],
+    policy: EnvironmentPolicy,
     *,
     strict: bool,
     path: str,
@@ -205,8 +303,16 @@ def _lookup(
     key = name[4:] if name.startswith("var.") else name
     if key in variables:
         return variables[key]
-    if not name.startswith("var.") and name in environ:
-        return environ[name]
+    if not name.startswith("var."):
+        # Checked whether or not the variable is set: a pipeline that names
+        # IRONFLOW_JWT_SECRET is refused even where it happens to be empty.
+        try:
+            policy.check(name)
+        except SecretError as exc:
+            exc.with_context(location=path or "<root>")
+            raise
+        if name in environ:
+            return environ[name]
     if default is not None:
         return default
     if strict:
@@ -255,13 +361,20 @@ def load_pipeline(
     variables: Mapping[str, Any] | None = None,
     roots: tuple[Path, ...] = (),
     strict_variables: bool = True,
+    env_policy: EnvironmentPolicy | None = None,
 ) -> PipelineSpec:
     """Load, merge, interpolate and validate a pipeline definition.
 
     Order matters: includes -> profile overlay -> CLI overrides -> variable
     interpolation -> model validation.  Interpolating before merging would make
     a profile unable to override a value that referenced a variable.
+
+    ``env_policy`` defaults to the operator's, from the process settings.
     """
+    if env_policy is None:
+        from ironflow.config.settings import get_settings
+
+        env_policy = EnvironmentPolicy.from_settings(get_settings())
     resolved = resolve_within(path, roots, must_exist=True)
     document = load_document(resolved, roots=roots)
     document = _apply_includes(document, resolved.parent, roots)
@@ -284,7 +397,9 @@ def load_pipeline(
         merged_variables.update(variables)
     document["variables"] = merged_variables
 
-    document = interpolate(document, merged_variables, strict=strict_variables)
+    document = interpolate(
+        document, merged_variables, strict=strict_variables, env_policy=env_policy
+    )
 
     try:
         spec = PipelineSpec.model_validate(document)
@@ -349,14 +464,28 @@ class PipelineRepository:
         return sorted(f.resolve() for f in files if not f.name.startswith("_"))
 
     def load_all(self, *, profile: str | None = None) -> list[PipelineSpec]:
-        """Load every discoverable pipeline, skipping ones that fail to parse."""
-        specs: list[PipelineSpec] = []
+        """Load every discoverable pipeline, skipping ones that fail to parse.
+
+        Files that declare the same pipeline ``name`` are skipped *together*:
+        run history, watermarks and the schedule are all keyed by name, so two
+        files sharing one would take turns running under one identity - the
+        scheduler registered the last, a manual run used the first, and each
+        advanced the other's watermark.  Neither is trusted to be the real one.
+        """
+        loaded: list[tuple[Path, PipelineSpec]] = []
         for file in self.discover():
             try:
-                specs.append(self.load(file, profile=profile))
+                loaded.append((file, self.load(file, profile=profile)))
             except ConfigurationError as exc:
                 logger.error("skipping invalid pipeline %s: %s", file.name, exc)
-        return specs
+        duplicates = _duplicate_names(loaded)
+        for name, files in duplicates.items():
+            logger.error(
+                "skipping pipeline %r: it is declared by more than one file (%s)",
+                name,
+                ", ".join(f.name for f in files),
+            )
+        return [spec for _, spec in loaded if spec.name not in duplicates]
 
     def load(self, path: str | Path, *, profile: str | None = None, **kwargs: Any) -> PipelineSpec:
         target = Path(path)
@@ -394,6 +523,7 @@ class PipelineRepository:
         trying to fix.
         """
         failures: list[tuple[Path, ConfigurationError]] = []
+        matches: list[tuple[Path, PipelineSpec]] = []
         for file in self.discover():
             try:
                 spec = self.load(file, profile=profile)
@@ -401,7 +531,15 @@ class PipelineRepository:
                 failures.append((file, exc))
                 continue
             if spec.name == name:
-                return spec
+                matches.append((file, spec))
+
+        if len(matches) > 1:
+            raise ConfigurationError(
+                f"pipeline {name!r} is declared by more than one file; rename one of them",
+                context={"files": [str(f) for f, _ in matches]},
+            )
+        if matches:
+            return matches[0][1]
 
         # A file named after the pipeline that would not load is almost always
         # the one being asked for, so report why it failed rather than denying
@@ -426,6 +564,14 @@ class PipelineRepository:
 
     def invalidate(self) -> None:
         self._cache.clear()
+
+
+def _duplicate_names(loaded: list[tuple[Path, PipelineSpec]]) -> dict[str, list[Path]]:
+    """Pipeline names declared by more than one file, with those files."""
+    by_name: dict[str, list[Path]] = {}
+    for file, spec in loaded:
+        by_name.setdefault(spec.name, []).append(file)
+    return {name: files for name, files in by_name.items() if len(files) > 1}
 
 
 __all__ = [

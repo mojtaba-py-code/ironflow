@@ -41,7 +41,7 @@ class ConnectorFactory:
         secrets: SecretResolver | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.secrets = secrets or SecretResolver(allow_literal=self.settings.allow_literal_secrets)
+        self.secrets = secrets or SecretResolver.for_pipelines(self.settings)
         self.runtime = ConnectorRuntime(settings=self.settings, secrets=self.secrets)
 
     def create_source(self, spec: ConnectorSpec, *, context: str = "") -> BaseSource:

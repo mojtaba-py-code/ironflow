@@ -223,29 +223,30 @@ class TestNotifications:
     def test_webhook_posts_a_redacted_payload(self, settings, monkeypatch):
         captured = {}
 
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            captured["json"] = kwargs.get("json")
-            return httpx.Response(200, request=httpx.Request("POST", url))
+        def handler(request):
+            captured["url"] = str(request.url)
+            captured["json"] = json.loads(request.content)
+            return httpx.Response(200)
 
-        monkeypatch.setattr(httpx, "post", fake_post)
         settings.allow_private_network = True
         notifier = WebhookNotifier(
             NotificationSpec(type="webhook", target="https://hooks.example.com/x"), settings
         )
+        notifier.http_client = lambda: httpx.Client(transport=httpx.MockTransport(handler))
         assert notifier.notify("subj", "body", {"password": "hunter2", "rows": 5})
+        assert captured["url"] == "https://hooks.example.com/x"
         assert "hunter2" not in json.dumps(captured["json"])
         assert captured["json"]["rows"] == 5
 
     def test_webhook_failure_is_swallowed(self, settings, monkeypatch, caplog):
-        def explode(*args, **kwargs):
+        def explode(request):
             raise httpx.ConnectError("no route to host")
 
-        monkeypatch.setattr(httpx, "post", explode)
         settings.allow_private_network = True
         notifier = WebhookNotifier(
             NotificationSpec(type="webhook", target="https://hooks.example.com/x"), settings
         )
+        notifier.http_client = lambda: httpx.Client(transport=httpx.MockTransport(explode))
         with caplog.at_level("ERROR"):
             assert notifier.notify("s", "b", {}) is False
         assert "webhook notification failed" in caplog.text
