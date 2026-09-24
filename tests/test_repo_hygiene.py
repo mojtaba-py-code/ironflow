@@ -10,11 +10,14 @@ interface.  These tests read the files themselves and fail when that happens.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+
+from ironflow.core.extras import EXTRAS, install_hint
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
@@ -139,6 +142,38 @@ class TestCompose:
         assert common["read_only"] is True
         assert common["cap_drop"] == ["ALL"]
         assert "no-new-privileges:true" in common["security_opt"]
+
+
+class TestInstallAdvice:
+    """IronFlow is not on PyPI, and the ``ironflow`` package there is another project.
+
+    Error messages and guides said ``pip install 'ironflow[api]'``: run where
+    IronFlow was not installed yet, that installs the other project's code.
+    """
+
+    BARE_NAME = re.compile(r"pip install\s+['\"]?ironflow(?![-\w.])")
+
+    def test_nothing_advises_installing_ironflow_by_name(self):
+        files = [*ROOT.glob("*.md"), *(ROOT / "docs").glob("*.md"), *(ROOT / "src").rglob("*.py")]
+        offenders = [
+            f"{path.relative_to(ROOT)}:{number}"
+            for path in files
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if self.BARE_NAME.search(line)
+        ]
+        assert offenders == []
+
+    def test_the_advice_names_what_each_extra_installs(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+        declared = {
+            name: tuple(requirements)
+            for name, requirements in project["optional-dependencies"].items()
+            if name not in {"dev", "all"}
+        }
+        assert declared == EXTRAS
+
+    def test_a_missing_extra_is_named_by_its_packages(self):
+        assert install_hint("api") == "pip install 'fastapi>=0.111' 'uvicorn[standard]>=0.29'"
 
 
 def test_dependabot_limits_routine_pip_updates_to_the_toolchain():

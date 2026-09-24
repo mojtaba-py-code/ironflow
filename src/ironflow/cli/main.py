@@ -39,6 +39,7 @@ from ironflow.cli.admin_commands import (
 )
 from ironflow.cli.context import EXIT_CANCELLED, EXIT_FAILED, EXIT_INVALID_CONFIG, build_context
 from ironflow.core.errors import ConfigurationError, IronFlowError
+from ironflow.core.extras import install_hint
 from ironflow.version import APP_TITLE, __version__
 
 logger = logging.getLogger(__name__)
@@ -129,7 +130,7 @@ def serve_command(
         import uvicorn
     except ImportError:
         cli.fail(
-            "the API requires the 'api' extra: pip install 'ironflow[api]'",
+            f"the API requires the 'api' extra: {install_hint('api')}",
             code=EXIT_INVALID_CONFIG,
         )
         return

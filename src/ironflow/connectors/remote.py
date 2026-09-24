@@ -41,6 +41,7 @@ from ironflow.core.errors import (
     LoadingError,
 )
 from ironflow.core.errors import ConnectionError as IFConnectionError
+from ironflow.core.extras import install_hint
 from ironflow.core.retry import call_with_retry
 from ironflow.core.types import LoadMode, RecordBatch, RecordStream
 from ironflow.security.guards import safe_filename
@@ -307,7 +308,7 @@ def _sftp_connect(connector: Any) -> Any:
         import paramiko
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise IFConnectionError(
-            "SFTP requires the 'remote' extra: pip install 'ironflow[remote]'"
+            f"SFTP requires the 'remote' extra: {install_hint('remote')}"
         ) from exc
 
     host = connector.str_option("host", required=True)

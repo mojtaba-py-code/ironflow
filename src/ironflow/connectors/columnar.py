@@ -1,6 +1,6 @@
 """Columnar and spreadsheet connectors: Parquet and Excel.
 
-Both depend on optional extras (``pip install 'ironflow[columnar,excel]'``).  The
+Both depend on optional extras (``columnar`` and ``excel``).  The
 imports are deferred to the first read/write so that a deployment that only
 moves CSV and SQL data does not carry ``pyarrow`` (~90 MB) in its image.
 
@@ -48,6 +48,7 @@ from ironflow.connectors.files import (
 )
 from ironflow.core.context import ExecutionContext, new_id
 from ironflow.core.errors import ExtractionError, LoadingError
+from ironflow.core.extras import install_hint
 from ironflow.core.types import DatasetSchema, LoadMode, Record, RecordBatch, RecordStream
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ def _require(module: str, extra: str) -> Any:
         return importlib.import_module(module)
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise ExtractionError(
-            f"this connector requires the '{extra}' extra: pip install 'ironflow[{extra}]'",
+            f"this connector requires the '{extra}' extra: {install_hint(extra)}",
             context={"module": module},
         ) from exc
 
