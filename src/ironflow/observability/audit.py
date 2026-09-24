@@ -23,6 +23,14 @@ Head anchor
     catches what no local file can: the log and its anchor deleted or replaced
     together.
 
+Several writers
+    The API, the scheduler and every CLI run audit to the same file.  They take
+    turns on ``<audit file>.lock``, and each re-reads the head under the lock
+    when another process has written since it last did - chaining from the
+    head it read at start-up forked the chain at the first run after anyone
+    else's.  The lock is local: on a file system without working locks, give
+    each host its own file.
+
 This does not prevent tampering - it makes tampering *detectable*, which is
 what the control actually asks for.  Preventing it requires shipping entries
 off-host, which is why :class:`AuditLog` also accepts a sink callable.
@@ -39,10 +47,12 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterator
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +72,13 @@ HMAC_SHA256 = "hmac-sha256"
 
 #: Suffix of the file that anchors the head of the chain, next to the log.
 ANCHOR_SUFFIX = ".head"
+#: Suffix of the empty file the writing processes take turns on.
+LOCK_SUFFIX = ".lock"
+
+#: How long to wait for another process to release the lock before going on
+#: without it: a verification of a very large log holds it for a while.
+_LOCK_TIMEOUT_SECONDS = 30.0
+_LOCK_POLL_SECONDS = 0.002
 
 _AUDIT_KEY_CONTEXT = b"ironflow-audit-chain-v1"
 _ANCHOR_MAC_CONTEXT = "ironflow-audit-head-v1"
@@ -169,10 +186,11 @@ class _Anchor:
 
 
 class AuditLog:
-    """Thread-safe, append-only, hash-chained audit log with a head anchor.
+    """Thread- and process-safe, append-only, hash-chained audit log with a head anchor.
 
-    One writing process per file: each process chains from the head it read
-    when it opened the log.
+    Writers in other processes are expected: every append, verification and
+    read holds ``<audit file>.lock``, and an append first re-reads the head if
+    the log changed since this process last touched it.
     """
 
     def __init__(
@@ -194,9 +212,12 @@ class AuditLog:
         #: Why the anchor must not be advanced, or None when it may be.
         self._anchor_problem: str | None = None
         self._anchor_problem_logged = False
+        #: The log as this process last saw it; None forces a re-read.
+        self._seen: tuple[int, int, int] | None = None
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._load_state()
+            with self._across_processes():
+                self._load_state()
 
     @property
     def path(self) -> Path | None:
@@ -206,6 +227,11 @@ class AuditLog:
     def anchor_path(self) -> Path | None:
         """``<audit file>.head``, where the entry count and head hash are anchored."""
         return self._path.with_name(self._path.name + ANCHOR_SUFFIX) if self._path else None
+
+    @property
+    def lock_path(self) -> Path | None:
+        """``<audit file>.lock``, which every process takes before touching the log."""
+        return self._path.with_name(self._path.name + LOCK_SUFFIX) if self._path else None
 
     @property
     def last_hash(self) -> str:
@@ -227,32 +253,23 @@ class AuditLog:
         system notices the gap, which is the compromise most audit
         implementations settle on between availability and completeness.
         """
+        fields = {
+            "action": action,
+            "actor": actor,
+            "outcome": outcome,
+            "resource": resource,
+            "correlation_id": correlation_id,
+            "details": details,
+        }
         with self._lock:
-            entry = AuditEntry(
-                action=action,
-                actor=actor,
-                outcome=outcome,
-                resource=resource,
-                correlation_id=correlation_id,
-                details=details,
-                previous_hash=self._last_hash,
-                algorithm=self._algorithm,
-            )
-            entry = AuditEntry(**{**_as_kwargs(entry), "entry_hash": entry.compute_hash(self._key)})
-            self._last_hash = entry.entry_hash
-
-            if not self._enabled:
-                return entry
-            if self._path is not None:
-                try:
-                    with self._path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(entry.to_dict(), default=str) + "\n")
-                except OSError:
-                    logger.error("failed to persist audit entry", exc_info=True)
-                else:
-                    self._entries += 1
-                    self._advance_anchor()
-            if self._sink is not None:
+            if not self._enabled or self._path is None:
+                entry = self._chain(fields)
+            else:
+                with self._across_processes():
+                    self._catch_up()
+                    entry = self._chain(fields)
+                    self._append(entry)
+            if self._enabled and self._sink is not None:
                 try:
                     self._sink(entry)
                 except Exception:
@@ -263,7 +280,8 @@ class AuditLog:
         """Read entries back, newest last."""
         if self._path is None or not self._path.exists():
             return []
-        entries = [json.loads(line) for line in self._iter_lines()]
+        with self._lock, self._across_processes():
+            entries = [json.loads(line) for line in self._iter_lines()]
         return entries[-limit:] if limit else entries
 
     def verify(self, *, expect_head: str | None = None) -> ChainVerification:
@@ -278,7 +296,7 @@ class AuditLog:
         expected = _normalise_head(expect_head)
         if self._path is None:
             return ChainVerification(intact=True, entries=0, head=GENESIS_HASH)
-        with self._lock:
+        with self._lock, self._across_processes():
             return self._verify(expected)
 
     def verify_chain(self, *, expect_head: str | None = None) -> tuple[bool, int | None]:
@@ -287,6 +305,58 @@ class AuditLog:
         return result.intact, result.broken_at
 
     # ------------------------------------------------------------------ #
+    def _chain(self, fields: dict[str, Any]) -> AuditEntry:
+        """The next entry, linked to the current head, which it becomes."""
+        entry = AuditEntry(**fields, previous_hash=self._last_hash, algorithm=self._algorithm)
+        entry = AuditEntry(**{**_as_kwargs(entry), "entry_hash": entry.compute_hash(self._key)})
+        self._last_hash = entry.entry_hash
+        return entry
+
+    def _append(self, entry: AuditEntry) -> None:
+        assert self._path is not None
+        try:
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry.to_dict(), default=str) + "\n")
+        except OSError:
+            logger.error("failed to persist audit entry", exc_info=True)
+            # The entry is not in the file, so nothing may chain from it: the
+            # next append re-reads the head from the file instead.
+            self._seen = None
+        else:
+            self._entries += 1
+            self._advance_anchor()
+            self._seen = self._signature()
+
+    def _catch_up(self) -> None:
+        """Re-read the head if the log changed since this process last saw it."""
+        if self._seen is not None and self._signature() == self._seen:
+            return
+        problem = self._anchor_problem
+        self._last_hash, self._entries, self._anchor_problem = GENESIS_HASH, 0, None
+        self._load_state()
+        if self._anchor_problem != problem:
+            self._anchor_problem_logged = False
+
+    def _signature(self) -> tuple[int, int, int]:
+        """Identity, size and modification time of the log - enough to see an append.
+
+        Taken from an open handle: a path lookup can be answered from directory
+        metadata, which on Windows may lag behind another process's write.
+        """
+        assert self._path is not None
+        try:
+            with self._path.open("rb") as handle:
+                status = os.fstat(handle.fileno())
+        except OSError:
+            return (0, -1, 0)
+        return (status.st_ino, status.st_size, status.st_mtime_ns)
+
+    @contextmanager
+    def _across_processes(self) -> Iterator[None]:
+        assert self.lock_path is not None
+        with _interprocess_lock(self.lock_path):
+            yield
+
     def _verify(self, expected: str | None) -> ChainVerification:
         assert self._path is not None and self.anchor_path is not None
         anchor_name = self.anchor_path.name
@@ -479,6 +549,7 @@ class AuditLog:
         carry an ``algorithm`` were written by a version that anchors, so a
         missing anchor beside them was removed, and is not quietly recreated.
         """
+        self._seen = self._signature()
         anchor, anchor_error = self._read_anchor()
         entries = 0
         last = GENESIS_HASH
@@ -583,6 +654,67 @@ def _normalise_head(value: str | None) -> str | None:
     return head
 
 
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_lock(descriptor: int) -> bool:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError:  # held by another process
+            return False
+        return True
+
+    def _unlock(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _try_lock(descriptor: int) -> bool:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:  # held by another process
+            return False
+        return True
+
+    def _unlock(descriptor: int) -> None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _interprocess_lock(path: Path) -> Iterator[None]:
+    """Hold ``path``'s exclusive lock for the block, so processes take turns.
+
+    Opened read-only - locking needs no more, so an operator who can only read
+    the audit directory can still take it.  When it cannot be taken at all - a
+    file system without locks, a holder that does not let go in time - the
+    block runs anyway, after a warning: an audit entry written without the lock
+    beats one not written, and a verification without it beats none.
+    """
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while not _try_lock(descriptor):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("another process has held it too long")
+            time.sleep(_LOCK_POLL_SECONDS)
+    except OSError as exc:
+        logger.warning("audit log lock unavailable (%s); continuing without it", exc)
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+    try:
+        yield
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                _unlock(descriptor)
+            os.close(descriptor)
+
+
 def _replace_file(path: Path, text: str) -> None:
     """Write ``text`` to a temporary file and move it over ``path``.
 
@@ -628,6 +760,7 @@ __all__ = [
     "ANCHOR_SUFFIX",
     "GENESIS_HASH",
     "HMAC_SHA256",
+    "LOCK_SUFFIX",
     "SHA256",
     "AuditEntry",
     "AuditLog",

@@ -13,6 +13,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -105,7 +109,11 @@ class TestHeadAnchor:
         audit = filled(log, 3)
         anchor = json.loads(anchor_path(log).read_text(encoding="utf-8"))
         assert anchor == {"entries": 3, "head": audit.last_hash}
-        assert sorted(p.name for p in log.parent.iterdir()) == ["audit.jsonl", "audit.jsonl.head"]
+        assert sorted(p.name for p in log.parent.iterdir()) == [
+            "audit.jsonl",
+            "audit.jsonl.head",
+            "audit.jsonl.lock",
+        ]
 
     def test_deleting_the_last_entries_is_detected(self, log):
         filled(log, 5)
@@ -227,6 +235,124 @@ class TestTheWriterKeepsTheEvidence:
         AuditLog(log).record("pipeline.run", actor="first-run-after-upgrade")
         result = AuditLog(log).verify()
         assert (result.intact, result.entries) == (True, 4)
+
+
+#: One writing process, started alongside others: it waits for ``go`` so the
+#: appends of every writer overlap, and signals ``ready`` once it has opened the
+#: log - which is when it reads the head it would otherwise chain from.
+WRITER = """
+import sys, time
+from pathlib import Path
+from ironflow.observability.audit import AuditLog
+log, go, ready, count = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4])
+audit = AuditLog(log)
+ready.touch()
+while not go.exists():
+    time.sleep(0.001)
+for index in range(count):
+    audit.record("pipeline.run", actor=f"{ready.name}-{index}")
+"""
+
+#: Another process holding the audit lock until it is killed.
+HOLDER = """
+import sys, time
+from pathlib import Path
+from ironflow.observability.audit import _interprocess_lock
+with _interprocess_lock(Path(sys.argv[1])):
+    print("locked", flush=True)
+    time.sleep(600)
+"""
+
+
+class TestSeveralWriters:
+    """The API, the scheduler and an operator's CLI run all audit to one file.
+
+    Each process used to chain from the head it read when it started, so the
+    first run after someone else's reported the trail as tampered with.
+    """
+
+    def test_a_long_running_writer_picks_up_what_another_process_appended(self, log):
+        server = filled(log, 2)  # `ironflow serve`, up for days
+        AuditLog(log).record("pipeline.run", actor="cli")  # an operator's run meanwhile
+        server.record("pipeline.run", actor="api")
+        result = AuditLog(log).verify()
+        assert (result.intact, result.entries) == (True, 4)
+
+    def test_processes_appending_at_once_keep_one_chain(self, log, tmp_path):
+        go, writers, count = tmp_path / "go", 3, 120
+        readies = [tmp_path / f"writer{number}" for number in range(writers)]
+        processes = [
+            subprocess.Popen(  # noqa: S603 - the test's own interpreter and script
+                [sys.executable, "-c", WRITER, str(log), str(go), str(ready), str(count)]
+            )
+            for ready in readies
+        ]
+        try:
+            deadline = time.monotonic() + 60
+            while not all(ready.exists() for ready in readies):
+                assert time.monotonic() < deadline, "a writer did not start"
+                assert all(process.poll() is None for process in processes)
+                time.sleep(0.01)
+            go.touch()
+            assert [process.wait(timeout=120) for process in processes] == [0] * writers
+        finally:
+            for process in processes:
+                process.kill()
+        result = AuditLog(log).verify()
+        assert (result.intact, result.detail) == (True, "")
+        assert result.entries == writers * count
+
+    def test_an_append_waits_while_another_process_holds_the_lock(self, log):
+        audit = filled(log, 1)
+        with subprocess.Popen(  # noqa: S603 - the test's own interpreter and script
+            [sys.executable, "-c", HOLDER, str(audit.lock_path)],
+            stdout=subprocess.PIPE,
+            text=True,
+        ) as holder:
+            try:
+                assert holder.stdout is not None
+                assert holder.stdout.readline().strip() == "locked"
+                appended = threading.Event()
+                writer = threading.Thread(
+                    target=lambda: (audit.record("pipeline.run", actor="waits"), appended.set())
+                )
+                writer.start()
+                assert not appended.wait(0.5), "appended while another process held the lock"
+                holder.kill()  # the lock goes with the process
+                assert appended.wait(30)
+                writer.join()
+            finally:
+                holder.kill()
+        assert AuditLog(log).verify().entries == 2
+
+    def test_without_the_lock_the_entry_is_still_written(self, log, monkeypatch, caplog):
+        """A file system without locks must not cost the audit trail its entries."""
+        audit = filled(log, 1)
+        monkeypatch.setattr("ironflow.observability.audit._LOCK_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr("ironflow.observability.audit._try_lock", lambda descriptor: False)
+        with caplog.at_level("WARNING"):
+            audit.record("pipeline.run", actor="unlocked")  # must not raise
+        assert "audit log lock unavailable" in caplog.text
+        assert AuditLog(log).verify().entries == 2
+
+    def test_a_failed_write_does_not_leave_a_link_to_nothing(self, log, monkeypatch, caplog):
+        """The next entry used to chain from the one that never reached the file."""
+        audit = filled(log, 2)
+        real_open = Path.open
+
+        def disk_full(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if self == log and "a" in mode:
+                raise OSError("disk full")
+            return real_open(self, mode, *args, **kwargs)
+
+        with monkeypatch.context() as patch, caplog.at_level("ERROR"):
+            patch.setattr(Path, "open", disk_full)
+            audit.record("pipeline.run", actor="lost")  # must not raise
+        assert "failed to persist audit entry" in caplog.text
+
+        audit.record("pipeline.run", actor="next")
+        result = AuditLog(log).verify()
+        assert (result.intact, result.entries) == (True, 3)
 
 
 class TestExpectedHead:
@@ -383,6 +509,10 @@ class TestCli:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("IRONFLOW_HOME", str(tmp_path / ".ironflow"))
         monkeypatch.setenv("COLUMNS", "400")
+        # No forced colour: CI sets FORCE_COLOR, and Rich's styling would put
+        # escape sequences into the text these tests read.
+        for variable in ("FORCE_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE"):
+            monkeypatch.delenv(variable, raising=False)
         reset_settings()
         path = get_settings().audit_file
         assert path is not None
