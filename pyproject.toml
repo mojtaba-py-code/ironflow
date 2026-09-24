@@ -37,7 +37,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-columnar = ["pyarrow>=15", "pandas>=2.2"]
+columnar = ["pyarrow>=25.0.1", "pandas>=2.2"]
 excel = ["openpyxl>=3.1"]
 remote = ["paramiko>=3.4"]
 api = ["fastapi>=0.111", "uvicorn[standard]>=0.29"]
