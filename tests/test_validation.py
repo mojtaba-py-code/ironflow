@@ -304,6 +304,16 @@ class TestValidationEngine:
         assert len(outcome.accepted) == 0
         assert outcome.rejected == []
 
+    def test_warn_policy_loads_the_record_and_reports_it(self, context):
+        """``warn`` used to drop the row from the load and quarantine it anyway."""
+        engine = self._engine(on_violation="warn")
+        bad = {"id": None, "amount": -1}
+        outcome = engine.validate_batch(RecordBatch([bad, {"id": 2, "amount": 5}]), context)
+        assert outcome.accepted.records == [bad, {"id": 2, "amount": 5}]
+        assert outcome.rejected == []
+        assert outcome.warnings == 2
+        assert engine.summary.records_rejected == 0
+
     def test_warning_severity_does_not_reject(self, context):
         spec = ValidationSpec.model_validate(
             {"rules": [{"type": "not_null", "field": "id", "severity": "warning"}]}

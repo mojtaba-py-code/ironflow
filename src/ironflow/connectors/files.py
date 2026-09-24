@@ -90,6 +90,9 @@ _JSON_DOCUMENT_MAX_BYTES = 100 * 1024**2
 _SURROGATE_ESCAPE = re.compile(r"\\u[dD][89abcdefABCDEF]")
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
+#: XML 1.0's EncName production - the only shape an encoding declaration takes.
+_XML_ENCODING_NAME = re.compile(r"[A-Za-z][A-Za-z0-9._-]*")
+
 #: Characters XML 1.0 forbids anywhere in a document, escaped or not: C0 controls
 #: other than TAB/LF/CR, lone surrogates, and the non-characters U+FFFE/U+FFFF.
 _XML_ILLEGAL = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
@@ -865,9 +868,20 @@ class XmlSink(_StagedFileSink):
         return _safe_tag(self.str_option("root_tag", "records"))
 
     def _on_open(self, context: ExecutionContext) -> None:
+        # The declaration names the encoding the file is actually written in -
+        # it used to say UTF-8 whatever `encoding` was, which a strict parser
+        # reads as a corrupt document. The name comes from the pipeline file,
+        # so it must match XML's own EncName grammar before it is written into
+        # the prolog.
+        encoding = self._encoding()
+        if not _XML_ENCODING_NAME.fullmatch(encoding):
+            raise ConfigurationError(
+                "encoding is not a valid XML encoding name",
+                context={"sink": self.name, "encoding": encoding[:40]},
+            )
         super()._on_open(context)
         assert self._handle is not None
-        self._handle.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        self._handle.write(f'<?xml version="1.0" encoding="{encoding}"?>\n')
         self._handle.write(f"<{self._root_tag}>\n")
 
     def write(self, batch: RecordBatch, context: ExecutionContext) -> int:

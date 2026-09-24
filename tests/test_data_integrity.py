@@ -578,6 +578,28 @@ class TestLoneSurrogates:
             {"name": [f"a{REPLACEMENT}b"]}
         ]
 
+    def test_http_sources_replace_them(self, factory, context):
+        import httpx
+
+        source = factory.create_source(
+            spec("rest", url="https://api.example.com/items", allow_private_network=True)
+        )
+        original = source._build_client
+
+        def build() -> httpx.Client:
+            client = original()
+            client._transport = httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=b'[{"name": "a\\ud83db", "pair": "\\ud83d\\ude00"}]'
+                )
+            )
+            return client
+
+        source._build_client = build
+        assert read_all(source, context) == [
+            {"name": f"a{REPLACEMENT}b", "pair": "\N{GRINNING FACE}"}
+        ]
+
     @pytest.mark.parametrize(
         ("destination", "suffix"),
         [({"type": "csv"}, "csv"), ({"type": "parquet"}, "parquet")],
@@ -814,6 +836,38 @@ class TestXmlOutputIsWellFormed:
             context,
         )
         assert [child.tag for child in parse_xml(target).find("record")] == ["a_", "_", accented]
+
+    def test_the_declaration_names_the_encoding_actually_used(self, factory, context, tmp_path):
+        """It said UTF-8 whatever ``encoding`` was, so a strict parser misread it."""
+        target = tmp_path / "out.xml"
+        write_all(
+            factory.create_sink(spec("xml", path=str(target), encoding="latin-1")),
+            [{"v": "caf\N{LATIN SMALL LETTER E WITH ACUTE}"}],
+            context,
+        )
+        assert target.read_bytes().startswith(b'<?xml version="1.0" encoding="latin-1"?>')
+        assert parse_xml(target).find("record").findtext("v") == "café"
+
+    def test_an_encoding_name_cannot_inject_into_the_prolog(self, factory, context, tmp_path):
+        sink = factory.create_sink(
+            spec("xml", path=str(tmp_path / "out.xml"), encoding='utf-8"?><!DOCTYPE x [')
+        )
+        with pytest.raises(ConfigurationError, match="XML encoding name"):
+            sink.open(context)
+
+
+class TestExcelHeader:
+    def test_a_configured_column_list_still_gets_a_header_row(self, factory, context, tmp_path):
+        """With ``columns:`` set, the sheet used to start at the first data row."""
+        openpyxl = pytest.importorskip("openpyxl")
+        target = tmp_path / "out.xlsx"
+        write_all(
+            factory.create_sink(spec("excel", path=str(target), columns=["id", "name"])),
+            [{"id": 1, "name": "a", "extra": "ignored"}],
+            context,
+        )
+        rows = list(openpyxl.load_workbook(target).active.iter_rows(values_only=True))
+        assert rows == [("id", "name"), (1, "a")]
 
 
 # --------------------------------------------------------------------------- #

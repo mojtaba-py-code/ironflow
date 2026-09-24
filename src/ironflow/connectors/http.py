@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -49,6 +50,7 @@ import httpx
 
 from ironflow.config.models import ConnectorSpec
 from ironflow.connectors.base import BaseSink, BaseSource, ConnectorRuntime, sink, source
+from ironflow.connectors.files import _replace_lone_surrogates
 from ironflow.core.context import ExecutionContext
 from ironflow.core.errors import (
     AuthenticationError,
@@ -568,16 +570,26 @@ class RestSource(HttpClientMixin, BaseSource):
         )
 
 
+#: A ``\uD800``-``\uDFFF`` escape in the raw body: the only way JSON produces a
+#: lone surrogate, which no sink can encode.
+_SURROGATE_ESCAPE = re.compile(rb"\\u[dD][89a-fA-F]")
+
+
 def _parse_json(response: HttpReply) -> Any:
     # The size limit was enforced while the body streamed in (`read_capped`).
     try:
-        return response.json()
+        payload = response.json()
     except (ValueError, RecursionError) as exc:  # RecursionError: absurd nesting
         raise ExtractionError(
             "response body is not valid JSON",
             context={"content_type": response.headers.get("content-type", "")},
             cause=exc,
         ) from exc
+    # As the file sources do: one legal "\ud83d" from an API would otherwise fail
+    # the load at the sink on every retry.
+    if _SURROGATE_ESCAPE.search(response.content):
+        payload = _replace_lone_surrogates(payload)
+    return payload
 
 
 def _extract_records(payload: Any, data_path: str) -> list[Any]:

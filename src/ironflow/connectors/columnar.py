@@ -458,6 +458,7 @@ class ExcelSink(FileConnectorMixin, BaseSink):
         self._workbook = openpyxl.Workbook(write_only=True)
         self._worksheet = self._workbook.create_sheet(self.str_option("sheet", "Sheet1"))
         self._columns = self.list_option("columns")
+        self._header_written = False
         self.rows_written = 0
 
     def write(self, batch: RecordBatch, context: ExecutionContext) -> int:
@@ -467,6 +468,10 @@ class ExcelSink(FileConnectorMixin, BaseSink):
         escape = self.bool_option("escape_formulas", True)
         if not self._columns:
             self._columns = list(batch.columns())
+        if not self._header_written:
+            # Written whether the columns came from `columns:` or from the data;
+            # with `columns:` set, the sheet used to start at the first data row.
+            self._header_written = True
             if self.bool_option("write_header", True):
                 # Column names come from the data, and openpyxl stores any string
                 # starting with "=" as a live formula - header cells included.

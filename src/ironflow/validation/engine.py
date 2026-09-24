@@ -13,8 +13,12 @@ what happens to the rejects according to
     The default, because it keeps the pipeline moving while preserving every bad
     record for analysis - a dropped record is a record nobody will ever
     investigate.
-``drop`` / ``warn``
-    Discard or keep-and-annotate.
+``drop``
+    Discard the record; it goes nowhere.
+``warn``
+    Keep the record in the load and report its violations as warnings.  It is
+    neither quarantined nor counted towards the circuit breakers: choosing
+    ``warn`` is choosing to load the data anyway.
 
 Two independent circuit breakers stop a run whose data has gone systemically
 wrong: an absolute reject count (``max_errors``) and a reject *rate*
@@ -166,7 +170,15 @@ class ValidationEngine:
             blocking = [v for v in violations if v.severity.blocks_record]
             warnings += len(violations) - len(blocking)
 
-            if blocking:
+            if blocking and self.spec.on_violation is OnViolation.WARN:
+                # `warn` keeps the record: its violations are reported, and the
+                # row is loaded like any other.  It used to be left out of the
+                # load *and* routed to the rejects, which made `warn` a quieter
+                # spelling of `quarantine` - rows an operator had chosen to keep
+                # never reached the destination.
+                warnings += len(blocking)
+                accepted.append(record)
+            elif blocking:
                 self.summary.records_rejected += 1
                 self._handle_rejection(record, blocking, rejected, index)
             else:
@@ -207,9 +219,8 @@ class ValidationEngine:
                     REJECT_REASON_KEY: "; ".join(f"[{v.rule}] {v.message}" for v in violations),
                 }
             )
-        elif policy is OnViolation.WARN:
-            rejected.append(dict(record))  # kept for reporting, not removed from the load
         # DROP: nothing to do - the record is simply not appended anywhere.
+        # (WARN never gets here: the record is kept, in `validate_batch`.)
 
     def _emit_metrics(
         self, context: ExecutionContext, violations: list[Violation], rejected: int
