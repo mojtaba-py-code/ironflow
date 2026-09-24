@@ -34,15 +34,39 @@ time, before evaluation.
 | `[x for x in y]` | rejected: comprehensions not allowed |
 | `getattr(str, "upper")` | rejected: absent from the function table |
 | `"a" * 10**9` | rejected: text arithmetic guard, then the size cap |
-| `2 ** 10000000` | rejected: exponent guard |
+| `2 ** 10000000` | rejected: the result would exceed 4,096 bits |
+| `(10**1000) ** 5000` | rejected: sized with `math.log2`, which takes any integer |
+| `regex_match(column, value)` | rejected at compile time: the pattern must be a literal |
+| `regex_match('(a\|aa)+$', value)` | cut off after 0.25 s; disabled after three timeouts |
+| `decimal(value) + 1` on `"abc"` | the record follows `on_error`, not the whole run |
 
 Dotted access (`params.force`) is *syntax for a mapping lookup* —
 `ast.Attribute` is handled by indexing a `Mapping` and returning `None` for
 anything else. `getattr` is never called, so no Python object is reachable.
 
 Limits: expression length (2,000 chars), AST node count (400), result sequence
-length (1,000,000). Compiled expressions are cached, so a rule over a million
-rows parses once.
+length (1,000,000), and the size of a power's result (4,096 bits) - measured on
+the *result*, so `1.05 ** 240` still works. The power guard once sized a result
+through `float(base)`, which overflows past about `10**308`; the overflow was
+read as "not huge" and `(10**1000) ** 5000` built a sixteen-million-bit integer.
+Compiled expressions are cached, so a rule over a million rows parses once.
+
+### Regular expressions
+
+`re` backtracks without limit and has no timeout, so a length cap stops nothing:
+`(a+)+$` - six characters - took 45 seconds on a 26-character value. Patterns
+written in pipeline files (`regex_match`, the `regex` validation rule, a
+`schema:` `pattern`) therefore compile on the `regex` engine
+(`ironflow/security/patterns.py`), which sidesteps catastrophic backtracking on
+most classic shapes and honours a per-match timeout on the rest:
+
+- every match has 0.25 s; a value the pattern cannot decide in time fails the
+  rule, or routes the record to `on_error`;
+- a pattern that times out three times is disabled for the process - a timeout
+  alone still costs `rows × timeout` over a large load;
+- `regex_match` takes its pattern as a **string literal**, compiled when the
+  expression is: a pattern read from a column would let the data choose the
+  regular expression.
 
 **Tested by** `tests/test_expressions.py::TestSandboxEscapes` — 27 real escape
 techniques, each asserted to be blocked.
@@ -68,18 +92,24 @@ connection.execute(text("SELECT * FROM t WHERE ts > :__watermark__"), params)
 ```
 
 **Identifiers** — table and column names — cannot be bound by any DB-API, so
-they are validated against `^[A-Za-z_][A-Za-z0-9_]{0,62}$` and then quoted for
-the dialect.
+they are validated against `[A-Za-z_][A-Za-z0-9_]{0,62}` as a **full** match and
+then quoted for the dialect. (`re.match` with `$` accepted `"orders\n"`: `$` also
+matches before a trailing newline.)
 
 ```yaml
 table: "orders; DROP TABLE users--"   # SecurityError at connector setup
 ```
 
-The one raw fragment accepted is the optional `where` option, which exists
-because real pipelines need predicates the model cannot express. It runs through
-`assert_no_sql_injection` (rejecting `;`, comments, `UNION`, DDL/DML verbs) —
-defence in depth, not the primary control. The primary control is that all
-values are bound.
+Two options accept raw SQL, because real pipelines need what the model cannot
+express: `query` (a whole statement) and `where` (a predicate). Both are SQL the
+pipeline author writes, run with the connector's database account - so the
+control that bounds them is that account's grants, and every *value* is still
+bound. `where` additionally passes `assert_no_sql_injection`, which refuses the
+shapes that turn a predicate into something else: statement stacking (`;`),
+comments (`--`, `/* */`, `#`), set operations, DDL/DML and `INTO`, time-delay
+functions (`pg_sleep`, `SLEEP`, `BENCHMARK`, `WAITFOR`) and server-side file
+access (`LOAD_FILE`, `pg_read_file`, `lo_import`, `OUTFILE`). Defence in depth,
+not the control.
 
 **Tested by** `tests/test_connectors.py::TestSql` and
 `tests/test_security.py::TestSqlGuards`, including that a malicious *value*
@@ -96,13 +126,18 @@ allow-listed root.
 
 Checking the string before resolution — the common mistake — is bypassed by a
 symlink inside an allowed directory. `Path.resolve()` first is what closes it.
+A Parquet *directory* is confined file by file for the same reason: only the
+directory used to be checked, so a symlink or junction inside it read files
+from anywhere.
 
 ```bash
 IRONFLOW_DATA_ROOTS=/srv/data,/mnt/exports
 ```
 
 Empty roots means unrestricted, which
-`Settings.validate_production_hardening()` refuses in production.
+`Settings.validate_production_hardening()` refuses in production. `file:` secret
+references have their own roots (`IRONFLOW_SECRET_FILE_ROOTS`) and no fallback:
+with none configured, they are refused - see §5.
 
 Filenames arriving from remote systems (SFTP listings, `Content-Disposition`)
 go through `safe_filename`, which strips directory components.
@@ -111,28 +146,76 @@ go through `safe_filename`, which strips directory components.
 
 ## 4. SSRF
 
-Outbound URLs are validated before every request:
-
-- scheme must be `http`/`https`;
-- the host may be restricted to a per-connector `allowed_hosts` list;
-- the host must not resolve to a private, loopback, link-local, reserved,
-  multicast or unspecified address — checked on the **resolved IP**, not the
-  hostname, so `evil.com → 127.0.0.1` is caught;
-- credentials embedded in the URL are stripped.
-
-Critically, **every hop is re-validated**:
-
-- redirects are *not* followed automatically. `follow_redirects=False`, and each
-  `Location` is resolved and re-checked, bounded to 5 hops. A 302 to
-  `169.254.169.254` cannot bypass a check that only ran on the original URL.
-- pagination links returned in the response body are re-validated the same way.
-
 `169.254.169.254` is the cloud metadata endpoint. Reaching it is how an
 innocuous "ingest this API" integration becomes IAM credential theft.
 
-**Tested by** `tests/test_coverage_gaps.py::TestHttpBehaviour` —
-`test_redirect_to_an_internal_address_is_blocked`,
-`test_pagination_links_are_revalidated`.
+### The policy is the operator's
+
+Where outbound HTTP may go is decided in platform settings, and a pipeline can
+only narrow it. That asymmetry is the point: a per-connector
+`allow_private_network: true` used to *override* the platform setting -
+production included - which put the metadata endpoint one line of YAML away.
+Now that option can only switch the guard on for a connector, and asking for
+the reverse fails `pipeline validate`.
+
+| Address | Reachable when |
+|---|---|
+| public (`is_global`) | always, subject to the allow-lists below |
+| private: RFC 1918, loopback, CGNAT `100.64.0.0/10`, IPv6 ULA, ... | the host or range is in `IRONFLOW_HTTP_PRIVATE_HOSTS`, or `IRONFLOW_ALLOW_PRIVATE_NETWORK` (refused in production) |
+| link-local (metadata), multicast, unspecified | never |
+
+Addresses are classified by `is_global` rather than a hand-written list, which
+is what catches ranges such as carrier-grade NAT that `is_private` does not;
+`::ffff:10.0.0.1` is judged as the IPv4 address it carries.
+
+`IRONFLOW_HTTP_ALLOWED_HOSTS`, when set, bounds *every* destination - HTTP
+connectors, OAuth2 token endpoints, webhook and Slack notifications - and a
+connector's own `allowed_hosts` narrows it further. It is the control that stops
+a pipeline file from posting a table, or a credential it was given, to a host
+nobody approved.
+
+### Checked where it cannot be raced
+
+`validate_url` resolves the host and checks the answers - and then an HTTP
+client resolves the name *again* to connect. A resolver that answers the check
+with a public address and the connection with `127.0.0.1` (DNS rebinding: a
+zero TTL, or a round-robin mixing the two) walked straight through.
+
+HTTP now goes through `ironflow.security.net`, whose transport resolves,
+checks and connects in one step inside the network backend: the socket is
+opened to an address the policy approved moments earlier, in the same call.
+TLS still verifies the certificate against the host *name*. A name that
+resolves to any disallowed address is refused as a whole. The same client
+serves connectors, OAuth2 token requests and notifications.
+
+Proxy environment variables (`HTTP_PROXY` and friends) are ignored: through a
+proxy, the address the policy approved is not the one the proxy connects to.
+
+### Every hop, and every credential
+
+- Redirects are *not* followed automatically. Each `Location` is re-validated,
+  bounded to 5 hops, and its query is not re-appended.
+- Pagination links returned by the server are re-validated the same way.
+- Credentials - `Authorization`, the API-key header and any custom `headers` -
+  are sent **only to the origin they were configured for**. A redirect or a
+  `next` link to another host gets none; a hostile API that answered with
+  `Location: https://evil.example` used to receive the bearer token.
+- Credentials embedded in a URL are stripped.
+
+### Bounded responses
+
+The response cap (`IRONFLOW_HTTP_MAX_RESPONSE_BYTES`) used to be checked after
+httpx had read - and decompressed - the whole body: 200 KB of gzip on the wire
+became 200 MB in memory before a 1 MB limit was consulted. Bodies are now
+streamed, and compressed ones inflated by IronFlow itself under zlib's
+`max_length`, so the cap applies to decoded bytes as they arrive: the same bomb
+peaks at about 2 MB. Clients ask for `gzip, deflate` only and refuse an encoding
+they cannot bound. Error bodies are read only as far as the message quotes them.
+
+**Tested by** `tests/test_network_policy.py` - a real local server behind a
+rebinding resolver, a 200 MB gzip bomb measured with `tracemalloc`, a redirect
+and a `next` link that try to collect the token - and
+`tests/test_coverage_gaps.py::TestHttpBehaviour`.
 
 ---
 
@@ -142,10 +225,39 @@ Pipeline files hold **references**, never values:
 
 | Reference | Resolution |
 |---|---|
-| `env:PGPASSWORD` | process environment |
-| `file:/run/secrets/db` | file contents (Docker/Kubernetes secrets) |
+| `env:PGPASSWORD` | process environment, within `IRONFLOW_PIPELINE_ENV` |
+| `file:/run/secrets/db` | file contents, within `IRONFLOW_SECRET_FILE_ROOTS` (Docker/Kubernetes secrets) |
 | `enc:ironflow:v1:…` | decrypted with the platform key |
 | `literal:…` | explicit escape hatch; warns, and is refusable by policy |
+
+### What a reference may reach
+
+A reference is only as safe as what it can name. Both `env:` and `file:` used
+to resolve *anything* - and a REST sink carries whatever it resolves to any
+public host the pipeline names, so `token: env:IRONFLOW_JWT_SECRET` sent the
+API's signing key out as a bearer header, and `file:` read SSH keys. `${NAME}`
+interpolation did the same into plain fields such as `owner`, which the API and
+the dashboard print.
+
+What a pipeline may read is now the operator's decision:
+
+- **IronFlow's own settings are never readable** - `IRONFLOW_JWT_SECRET`,
+  `IRONFLOW_ENCRYPTION_KEY`, `IRONFLOW_STATE_DATABASE_URL` and every other
+  field of `Settings`, derived from the model so a new one is covered without
+  anyone remembering to list it. They are refused even when unset, and in any
+  letter case, since pydantic-settings reads `ironflow_jwt_secret` as the
+  setting too.
+- **`IRONFLOW_PIPELINE_ENV`** allow-lists the rest, as glob patterns, for
+  `env:` and `${NAME}` alike. Production refuses to start without it.
+- **`file:` is off** until `IRONFLOW_SECRET_FILE_ROOTS` names the directories
+  secrets live in; a path outside them is a `SecurityError`, not a typo.
+
+Every code path that resolves a reference from a pipeline file - connectors,
+notifications, `hash_columns` and `encrypt_columns` keys - builds its resolver
+through `SecretResolver.for_pipelines(settings)`, which applies all of the
+above. It also carries the platform key: connectors used to be built without
+one, so a documented `enc:` reference failed with "no encryption key is
+configured" even when one was.
 
 Resolved values are wrapped in `SecretStr`:
 
@@ -225,6 +337,21 @@ Three layers, because one is never enough:
    logging a raw DSN does not put the password on disk.
 3. `redact_mapping` runs over every report, audit entry and API error payload.
 
+URL credentials are found by parsing, not by one regex. The regex ended the
+password at the first `/` - routine in a base64 password - and never looked at
+the query string, so `config show`, `config check` and the state database's
+error context printed a DSN whose password contained a `/`, or one passed as
+`?password=`, verbatim. The password is now everything between the userinfo's first `:` and
+its last `@`, and credential-like query parameters (`password`, `token`,
+`sslpassword`, ...) are masked too, while the host and database stay visible.
+
+Terminal output is the fourth surface. Pipeline fields and run data reach the
+CLI, and Rich reads `[...]` as markup and passes escape sequences through: an
+`owner: "[/x]"` crashed `pipeline list` for the whole directory, a
+`[link=...]` became a live hyperlink, and `\x1b[...` wrote to the operator's
+terminal. That data is now printed as text, with control characters shown
+escaped rather than obeyed.
+
 Booleans and numbers are never redacted: blanking
 `allow_literal_secrets: false` hides a policy flag an operator needs to see and
 protects nothing.
@@ -261,6 +388,26 @@ Nothing grants `secret:read` except `admin`. Principals can additionally be
 scoped to pipeline-name patterns, so a team gets `pipeline:run` on `sales_*`
 without gaining it everywhere.
 
+A scope holds on **every** read, including the ones that name no pipeline. A
+principal scoped to `sales_*` used to be refused
+`/api/pipelines/hr_payroll/status` and then read the same data through
+`/api/runs`, `/api/runs/{id}` (error text included), `/api/statistics` and
+`/metrics`. Now:
+
+- the run list, the statistics and the dashboard filter through
+  `PipelineService.visible_pipelines`, which turns the principal's patterns
+  into the names it may see;
+- a run outside the scope is a **404**, not a 403 - the answer must not confirm
+  that an execution id exists;
+- `/metrics` needs a principal with no pipeline scope: every series carries a
+  pipeline label and cannot be filtered per caller;
+- `pipeline resume` refuses an execution id that belongs to another pipeline.
+
+With authentication on, the dashboard at `/` needs a token like any other
+route; it used to render the pipeline inventory and the run timeline to anyone.
+CORS never runs in credentials mode: bearer tokens do not need it, and with it
+on Starlette reflects any origin a `"*"` list admits.
+
 The CLI runs as the OS user: anyone who can run the binary already has the
 host's credentials, so a second factor there would be theatre. The audit trail
 records *who* ran the command.
@@ -272,16 +419,25 @@ records *who* ran the command.
 Parsed with `defusedxml`, closing the billion-laughs, quadratic-blowup and
 external-entity (XXE) attacks that the stock `xml.etree` parser is vulnerable
 to. **Tested by** `tests/test_connectors.py::TestXml` with a real entity bomb and
-a real XXE document.
+a real XXE document. XML files are size-capped, and each record is detached
+from the root once converted - `clear()` alone kept every one hanging off it, so
+memory grew with the file.
+
+What IronFlow *writes* is always well-formed: characters XML 1.0 forbids (a
+`\x01` in a value used to publish a document no parser would open) become
+U+FFFD, element names derived from column names and the `root_tag` are
+sanitised, and the declaration names the encoding actually used.
 
 ---
 
 ## 10. Spreadsheet formula injection
 
-A CSV or XLSX cell beginning `=`, `+`, `-` or `@` is executed as a formula when
-opened. `=cmd|' /c calc'!A1` in an exported customer name is remote code
-execution on the analyst's laptop. Both writers prefix such values with an
-apostrophe.
+A CSV or XLSX cell beginning `=`, `+`, `-`, `@`, TAB or CR is executed as a
+formula when opened. `=cmd|' /c calc'!A1` in an exported customer name is remote
+code execution on the analyst's laptop. Both writers prefix such values with an
+apostrophe - and the **column headers** too, which come from the data just as
+the values do. (Headers were written raw, and in XLSX a header `=1+1` became a
+live formula cell.)
 
 ---
 
@@ -296,18 +452,60 @@ apostrophe.
 - FTP defaults to `FTP_TLS` **with `prot_p()`**, so the data channel is encrypted
   too, not only the control channel. Plain FTP is refused in production.
 - PostgreSQL connections request `sslmode=require` by default.
+- SMTP notifications upgrade with STARTTLS through a **verifying** context
+  (the system trust store, where a company CA is usually installed).
+  `starttls()` without a context - as it was called - encrypts but checks no
+  certificate, so anyone in the path could present one and read the SMTP
+  password; credentials are never sent without TLS.
 
 ---
 
 ## 12. Audit trail
 
-Privileged actions append to a SHA-256 hash chain: each entry stores
-`hash(previous_hash || canonical_payload)`. Editing or deleting any entry breaks
-every subsequent link.
+Privileged actions append to a hash chain: each entry stores
+`mac(previous_hash || canonical_payload)`, so editing, inserting or removing an
+entry breaks the next link, and verification names the first broken one.
+
+A chain alone had two blind spots, both closed:
+
+- **It could be re-derived.** With a plain SHA-256 chain, anyone who could edit
+  the file could recompute every hash after their edit. With
+  `IRONFLOW_ENCRYPTION_KEY` set, entries are chained with **HMAC-SHA256** under
+  a key derived from it (`HMAC(encryption_key, "ironflow-audit-chain-v1")` -
+  derived, so the key that protects secrets never feeds a second primitive).
+  Every entry records its algorithm, so a log written before a key existed
+  still verifies.
+- **It could not see its own end.** Deleting the last entries - or the whole
+  file - left a chain that verified from genesis, and `--verify` said "intact".
+  After every append the entry count and head are written atomically to
+  `<audit file>.head` (MACed when keyed), and verification compares the log
+  with it: a shorter log, a missing log, a missing anchor or a disagreeing one
+  is reported as broken, with the reason.
 
 ```bash
 ironflow state audit --verify
 ```
+
+The output prints the head. Recorded off-host - a ticket, a separate system -
+it catches what no local file can, the log and its anchor replaced together:
+
+```bash
+ironflow state audit --expect-head <head-recorded-earlier>
+```
+
+Two operational properties matter as much as the cryptography:
+
+- **Several writers share one trail.** The API, the scheduler and every CLI
+  run audit to the same file. Each process used to chain from the head it read
+  at start-up, so the first API run after an operator's CLI run forked the
+  chain - and verification reported tampering that never happened, which
+  teaches people to ignore it. Appends now take turns on `<audit file>.lock`
+  and re-read the head under it whenever another process has written. The
+  lock is local; on network storage, give each host its own file.
+- **The key is part of the trail.** Under a different
+  `IRONFLOW_ENCRYPTION_KEY` every older entry reads as edited, so a key
+  rotation closes the trail first - see
+  [rotating the platform key](deployment.md#rotating-the-platform-key).
 
 This makes tampering **detectable**, not impossible — which is what the control
 actually asks for. Preventing it requires shipping entries off-host, which is
@@ -340,6 +538,7 @@ unless:
 - `allow_literal_secrets` is false;
 - `allow_private_network` is false;
 - `data_roots` confines connectors to explicit directories;
+- `pipeline_env` lists the environment variables pipeline files may read;
 - `http_verify_tls` is on;
 - `audit_enabled` is true;
 - the state database is not SQLite.
@@ -352,14 +551,59 @@ unauthenticated API in production.
 
 ## Supply chain
 
-- `scripts/check_secrets.py` runs pre-commit and in CI, refusing DSNs with
-  inline passwords, AWS keys, private key blocks, Slack webhooks, GitHub tokens
-  and assigned secret literals. It reports the number of files scanned, because
-  "clean" after scanning nothing is not clean.
-- `pip-audit` runs in CI against the dependency tree.
-- ruff's bandit rules (`S`) run over the whole codebase on every commit.
-- The container image is multi-stage: no compilers in the runtime, unprivileged
-  user, `no-new-privileges`, all capabilities dropped.
+The repository is held to the same standard as the code: every claim below is
+a CI job that fails the build, not a setting someone meant to turn on.
+
+- **Workflows.** Every action is pinned to a commit SHA and kept current by
+  Dependabot. The default token is read-only, a job that needs more asks for it
+  by name, no checkout keeps credentials in `.git/config`, and every job has a
+  timeout.
+- **`main` is protected.** No force-push, no deletion, and every commit on it
+  is signed.
+- **Secrets.** GitHub secret scanning with push protection; gitleaks over every
+  commit and the working tree on every push (the binary pinned by version *and*
+  checksum); and `scripts/check_secrets.py`, which reports how many files it
+  scanned, because "clean" after scanning nothing is not clean.
+- **Dependencies.** `pip-audit` audits the resolved dependency set of a full
+  install on every push and weekly, and fails on an advisory. (It used to run
+  over an environment containing IronFlow itself, which is not on PyPI; every
+  run stopped at that lookup and `continue-on-error` reported a pass - it had
+  never audited anything.) Pull requests also go through dependency review.
+  Dependabot security updates are on; routine version PRs are limited to the
+  development toolchain, the actions and the base-image digest.
+- **Static analysis.** CodeQL's security suite on every push and weekly, ruff's
+  bandit rules (`S`), and strict mypy.
+- **Container.** Multi-stage; base pinned by digest with Debian updates applied
+  at build; no compilers, no `curl` and no `pip` in the runtime; uid 1001. CI
+  runs it read-only with every capability dropped and `no-new-privileges`, and
+  Grype fails the build on any high or critical vulnerability that has a fix.
+- **Releases.** A tag builds the sdist and wheel, smoke-tests the wheel in a
+  clean environment, writes a CycloneDX SBOM, and signs SLSA build provenance
+  through Sigstore - no long-lived signing key exists to steal:
+  `gh attestation verify ironflow-X.Y.Z-py3-none-any.whl --repo mojtaba-py-code/ironflow`.
+- **OpenSSF Scorecard** assesses all of this on every push to `main` and weekly.
+- **Not on PyPI.** The name `ironflow` there belongs to an unrelated project;
+  install from a verified release, never by bare name.
+
+## What this does not do
+
+The limits, stated plainly so nobody mistakes the controls above for more than
+they are:
+
+- **Raw SQL is the author's.** A `query:` or `where:` runs with the connector's
+  database account; the grants on that account are the control.
+- **Egress is bounded only as far as the operator bounds it.** Data - or a
+  credential a pipeline was given - can reach any host `IRONFLOW_HTTP_ALLOWED_HOSTS`
+  admits, and any public host when it is unset. A network egress policy is the
+  layer below.
+- **The HTTP network policy covers HTTP.** SQL, SFTP, FTP and SMTP hosts are the
+  pipeline's choice; host-key checking (SFTP) and certificate verification
+  (TLS) are what authenticate those peers.
+- **Production hardening is enforced at API start-up**, and reported by
+  `ironflow config check` and `/health`. A batch `pipeline run` does not refuse
+  to start, so run `config check` in the deployment pipeline.
+- **A JSON document is parsed whole** (JSON Lines streams). Its default cap is
+  100 MiB.
 
 ## Reporting a vulnerability
 

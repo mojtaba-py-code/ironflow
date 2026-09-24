@@ -7,8 +7,16 @@ From zero to a running pipeline.
 ## 1. Install and scaffold
 
 ```bash
-pip install "ironflow[columnar,excel]"
+git clone https://github.com/mojtaba-py-code/ironflow.git && cd ironflow
 ```
+
+```bash
+pip install ".[columnar,excel]"
+```
+
+IronFlow is not on PyPI, and the `ironflow` package there is another project -
+never install it by bare name. For production, install a release wheel verified
+with `gh attestation verify`: see [deployment.md](deployment.md#install).
 
 ```bash
 ironflow config init
@@ -173,6 +181,11 @@ incremental:
 The watermark advances **only after the destination commits**, so a failed load
 never skips rows on the next run.
 
+The source has to apply the watermark for this to mean anything, so
+`strategy: incremental` is accepted only on sources that do - the SQL
+connectors. On a file source it is refused before anything is read; it used to
+be accepted and quietly re-read the whole file on every run.
+
 ```bash
 ironflow state watermarks orders
 ```
@@ -196,6 +209,11 @@ source:
   # or: file:/run/secrets/dsn   # Docker/Kubernetes secret
   # or: enc:ironflow:v1:...     # encrypted with the platform key
 ```
+
+What a reference may reach is decided by the operator, not the pipeline:
+`env:` reads only variables allowed by `IRONFLOW_PIPELINE_ENV` (and never
+IronFlow's own settings), and `file:` works only inside
+`IRONFLOW_SECRET_FILE_ROOTS`.
 
 ```bash
 ironflow secrets generate-key           # once, store in a secret manager
@@ -270,7 +288,9 @@ ironflow pipeline resume orders <execution-id> # restart at the failure
 ```
 
 Resume skips tasks that already succeeded. Because transactional destinations
-rolled back, there is nothing to clean up first.
+rolled back, there is nothing to clean up first. The execution id must be a run
+of the pipeline you name: an unknown id, or another pipeline's, is refused
+rather than silently treated as a fresh run.
 
 For a fresh attempt from the beginning:
 

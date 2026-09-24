@@ -58,19 +58,43 @@ The resolved path — after collapsing `..` and following symlinks — is outsid
 
 ### `URL resolves to a non-public address (SSRF guard)`
 
-The target resolves to a private, loopback or link-local address. For a genuinely
-internal API, prefer an explicit per-connector allow-list over disabling the
-guard globally:
+The target resolves to a private or loopback address. Reaching one is the
+operator's decision, not the pipeline's: list the host (or its address range)
+in the platform settings rather than disabling the guard.
 
-```yaml
-source:
-  type: rest
-  url: https://internal-api.corp.local/v1/orders
-  allow_private_network: true
-  allowed_hosts: [internal-api.corp.local]
+```bash
+IRONFLOW_HTTP_PRIVATE_HOSTS=internal-api.corp.local,10.20.0.0/16
 ```
 
-`allow_private_network` cannot be enabled in a production environment.
+The check runs on the address the connection actually uses, so a name that
+resolves differently at connect time than it did a moment earlier is refused
+too. "that no setting opens" in the message means a link-local address - where
+cloud metadata services answer - which nothing makes reachable.
+
+### `a pipeline cannot switch off the SSRF guard`
+
+A connector set `allow_private_network: true` while the platform does not allow
+private addresses. That option can only switch the guard *on* for a connector;
+use `IRONFLOW_HTTP_PRIVATE_HOSTS` as above.
+
+### `host is not in the IRONFLOW_HTTP_ALLOWED_HOSTS allow-list`
+
+The operator has bounded where pipelines may send data, and this host is not on
+the list. Ask for it to be added; a connector's own `allowed_hosts` can only
+narrow the operator's list.
+
+### `environment variable is not in IRONFLOW_PIPELINE_ENV` / `pipeline files cannot read IronFlow's own configuration`
+
+A `${NAME}` or `env:NAME` names a variable outside the operator's allow-list,
+or one of IronFlow's own settings (`IRONFLOW_JWT_SECRET` and the rest), which
+no pipeline may read. Add the variable to `IRONFLOW_PIPELINE_ENV` if a pipeline
+genuinely needs it.
+
+### `file: secret references are disabled`
+
+`file:` needs `IRONFLOW_SECRET_FILE_ROOTS` - the directories secrets may be read
+from, such as `/run/secrets`. A path outside them is refused as a security
+error.
 
 ### `invalid SQL identifier`
 
@@ -198,12 +222,15 @@ the rollback is clean. Raise `timeout`, or reduce the work.
 
 ### `unable to create the database engine … No module named 'psycopg'`
 
-Install the driver extra: `pip install "ironflow[postgres]"` (or `[mysql]`).
+Install the driver: `pip install 'psycopg[binary]>=3.1'` (the `postgres` extra),
+or `pip install 'PyMySQL>=1.1'` for MySQL.
 
 ### `this connector requires the 'columnar' extra`
 
-`pip install "ironflow[columnar]"` for Parquet, `[excel]` for XLSX,
-`[remote]` for SFTP.
+The message names the packages to install: `pyarrow` and `pandas` for Parquet
+(the `columnar` extra), `openpyxl` for XLSX (`excel`), `paramiko` for SFTP
+(`remote`). Or reinstall IronFlow with the extra, from where you installed it -
+never by the bare name `ironflow`, which on PyPI is another project.
 
 ### `SFTP authentication failed`
 
@@ -280,10 +307,39 @@ incremental:
 More than one scheduler instance. It holds no distributed lock — run exactly one,
 or use your orchestrator's scheduler with `concurrencyPolicy: Forbid`.
 
-### `audit chain broken at entry N`
+### `audit chain broken ...`
 
-The audit file was edited or truncated. Entry N is the first that does not
-verify. This is what the hash chain is for; investigate before dismissing it.
+`ironflow state audit --verify` names the first problem it finds, and - when it
+is in one entry - that entry's position, counting from 0. `--json` adds a stable
+`problem` code for scripts. This is what the chain is for: treat each of these
+as possible tampering until you have ruled it out.
+
+| `problem` | The message says | Usually means |
+|---|---|---|
+| `key_required` | `... no audit key is configured` | The log is keyed. Verify with `IRONFLOW_ENCRYPTION_KEY` set to the platform's key |
+| `entry_modified` | `it does not match its hash - it was edited, or written under a different IRONFLOW_ENCRYPTION_KEY` | An edited entry - or the key was changed; see [rotating the platform key](deployment.md#rotating-the-platform-key) |
+| `chain_broken` | `it does not link to the entry before it` | An entry was inserted, removed or reordered |
+| `downgraded` | `it is unkeyed although earlier entries are keyed` | The tail was rewritten by someone without the key |
+| `entry_unreadable` | `it is not a well-formed audit entry` | A damaged line: an edit, or a disk that filled mid-write |
+| `truncated` | `the log ends after N of the M entries its head anchor records` | The last entries were deleted |
+| `log_missing` | `the log is missing but its head anchor records N entries` (or `empty`) | The log was deleted or emptied |
+| `anchor_missing` | `the log has N entries but no head anchor` | The `.head` file was deleted - or the log was written by a version before 1.1.0, in which case the next audited action creates it |
+| `anchor_unreadable`, `anchor_forged` | `the head anchor ...` | The `.head` file was edited, or written under a different key |
+| `anchor_unkeyed` | `the head anchor is not keyed although an audit key is configured` | The key was set only just now (the next audited action re-anchors), or the log was rewritten without it |
+| `anchor_mismatch` | `it is not the head the anchor records` | The log was rewritten |
+| `unanchored_entries` | `the anchor covers only the first N of M` | An append whose anchor update failed - the next append heals it - or entries added by hand |
+| `expected_head_missing` | `the expected head is not in the log` | The head you recorded with `--expect-head` is gone: entries up to it were deleted or rewritten |
+
+The writer never "repairs" a log that contradicts its anchor - that would erase
+the evidence. Once you have investigated, move the log **and** its `.head` file
+aside together and keep them; the next audited action starts a new chain.
+
+Several IronFlow processes - the API, the scheduler, your CLI runs - may share
+one audit file: they take turns on `<audit file>.lock`. That lock needs a local
+file system; on network storage without working locks, give each host its own
+`IRONFLOW_AUDIT_FILE`. If the log shows `audit log lock unavailable`, the
+entries are still written, but two processes appending at the same moment could
+break the chain.
 
 ---
 

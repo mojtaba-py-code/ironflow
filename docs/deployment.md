@@ -2,9 +2,29 @@
 
 ## Install
 
+IronFlow is **not published on PyPI**, and the name `ironflow` there belongs to
+an unrelated project (a visual scripting interface for pyiron). `pip install
+ironflow` installs that, not this - so never install it by bare name, and never
+list it by bare name in a requirements file.
+
+Install a release wheel instead, after checking it was built by this
+repository's release workflow from the tagged commit:
+
 ```bash
-pip install "ironflow[columnar,excel,api]"
+gh release download v1.1.0 --repo mojtaba-py-code/ironflow --pattern "*.whl"
 ```
+
+```bash
+gh attestation verify ironflow-1.1.0-py3-none-any.whl --repo mojtaba-py-code/ironflow
+```
+
+```bash
+pip install "ironflow-1.1.0-py3-none-any.whl[columnar,excel,api]"
+```
+
+Each release also carries a CycloneDX SBOM (`ironflow-X.Y.Z.cdx.json`) and a
+`SHA256SUMS` file. From source, `pip install ".[columnar,excel,api]"` in a
+checkout of the tag does the same.
 
 Extras are opt-in so a slim image stays slim. `pyarrow` alone is ~90 MB.
 
@@ -17,8 +37,9 @@ Extras are opt-in so a slim image stays slim. `pyarrow` alone is ~90 MB.
 | `postgres` / `mysql` | database drivers |
 | `all` | everything |
 
-A connector whose extra is missing fails with an actionable message
-(`pip install 'ironflow[columnar]'`) rather than an ImportError at start-up.
+A connector whose extra is missing fails with a message naming the packages
+to install (`pip install 'pyarrow>=15' 'pandas>=2.2'`) rather than an
+ImportError at start-up.
 CI has a job that proves the slim install still runs the CSV/SQL/REST paths.
 
 ---
@@ -26,30 +47,41 @@ CI has a job that proves the slim install still runs the CSV/SQL/REST paths.
 ## Container
 
 ```bash
-docker build -f docker/Dockerfile -t ironflow:1.0.0 .
+docker build -f docker/Dockerfile -t ironflow:1.1.0 .
 ```
 
 ```bash
-docker run --rm \
+docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
+  --security-opt no-new-privileges \
   -e IRONFLOW_ENVIRONMENT=production \
   -e IRONFLOW_STATE_DATABASE_URL="postgresql+psycopg://ironflow:***@db:5432/ironflow" \
   -e IRONFLOW_ENCRYPTION_KEY="$(cat /run/secrets/ironflow_key)" \
   -e IRONFLOW_DATA_ROOTS=/data \
+  -e IRONFLOW_PIPELINE_ENV="IRONFLOW_HASH_KEY,WAREHOUSE_*" \
   -v /srv/pipelines:/etc/ironflow/pipelines:ro \
   -v /srv/data:/data \
-  ironflow:1.0.0 pipeline run sales_daily
+  ironflow:1.1.0 pipeline run sales_daily
 ```
 
-The image is multi-stage: the builder has compilers, the runtime does not.
-It runs as uid 1001 and writes only under `/var/lib/ironflow`.
+The image is multi-stage: the builder has compilers, the runtime does not -
+and it has no `curl` either; the healthcheck uses the interpreter. The base is
+pinned by digest. It runs as uid 1001, writes only under `/var/lib/ironflow`,
+and CI proves it with the flags above: read-only root, every capability
+dropped, `no-new-privileges`. Every image CI builds is scanned with Grype.
 
 ### Local stack
+
+```bash
+export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
+```
 
 ```bash
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-PostgreSQL, the API on `127.0.0.1:8080`, and a single scheduler replica.
+PostgreSQL, the API on `127.0.0.1:8080`, and a single scheduler replica, each
+with a read-only root filesystem. There is no default database password;
+compose refuses to start without one.
 
 ---
 
@@ -69,6 +101,17 @@ once, not one per attempt.
 - [ ] `IRONFLOW_ALLOW_LITERAL_SECRETS=false`
 - [ ] `IRONFLOW_ALLOW_PRIVATE_NETWORK=false`
 - [ ] `IRONFLOW_DATA_ROOTS` confines connectors to explicit directories
+- [ ] `IRONFLOW_PIPELINE_ENV` lists the environment variables pipelines may read
+
+Not enforced, but part of the same posture:
+
+- [ ] `IRONFLOW_HTTP_ALLOWED_HOSTS` names the hosts pipelines may send data to,
+      and a network egress policy says the same thing one layer down
+- [ ] Internal APIs listed in `IRONFLOW_HTTP_PRIVATE_HOSTS` - never opened with
+      `IRONFLOW_ALLOW_PRIVATE_NETWORK`
+- [ ] `IRONFLOW_SECRET_FILE_ROOTS` set only if pipelines use `file:` secrets
+- [ ] Database accounts used by pipelines hold only the grants their pipelines
+      need: a `query:` or `where:` is SQL the pipeline author writes
 - [ ] `IRONFLOW_LOG_JSON=true`
 - [ ] Notifications configured on every scheduled pipeline
 
@@ -110,6 +153,11 @@ Put a reverse proxy in front for TLS termination. `serve` refuses to start an
 unauthenticated API in a production environment and warns when binding to all
 interfaces without auth.
 
+With authentication on, every route but `/health` needs a bearer token - the
+dashboard at `/` included. A browser does not send one by itself, so reach the
+dashboard through an authenticating proxy (an SSO gateway that injects the
+`Authorization` header) rather than by opening it up.
+
 ---
 
 ## Kubernetes
@@ -139,7 +187,7 @@ spec:
             fsGroup: 1001
           containers:
             - name: ironflow
-              image: ironflow:1.0.0
+              image: ironflow:1.1.0
               args: ["pipeline", "run", "sales_daily", "--log-json"]
               envFrom:
                 - configMapRef: {name: ironflow-config}
@@ -196,7 +244,10 @@ ironflow state clean --history-days 90 --checkpoint-days 30
 
 ### Metrics
 
-`/metrics` serves Prometheus text exposition.
+`/metrics` serves Prometheus text exposition. With authentication on, the
+scraper needs a token with `metrics:read` and **no pipeline scope**: every
+series carries a pipeline label, so a principal scoped to `sales_*` would read
+every other team's volumes there, and is refused.
 
 ```yaml
 - job_name: ironflow
@@ -241,10 +292,49 @@ and schema snapshots — losing the watermarks means the next incremental run
 re-reads everything from the beginning.
 
 The audit log (`$IRONFLOW_HOME/audit/audit.jsonl`) is append-only and
-hash-chained; back it up separately and verify after restore:
+hash-chained - keyed with a key derived from `IRONFLOW_ENCRYPTION_KEY` - and its
+head is anchored in `audit.jsonl.head` beside it. Back up **both** files
+together (the empty `audit.jsonl.lock` beside them needs no backup), and verify
+after restore:
 
 ```bash
 ironflow state audit --verify
+```
+
+The command prints the chain's head. Recording it somewhere off-host on a
+schedule is what lets a later check prove nothing was removed since:
+
+```bash
+ironflow state audit --expect-head <head-recorded-earlier>
+```
+
+The API, the scheduler and CLI runs on one host can share the file - appends
+take turns on the `.lock` file - but that needs a local file system. On
+network storage, give each host its own `IRONFLOW_AUDIT_FILE`.
+
+### Rotating the platform key
+
+Nothing re-encrypts itself: a new `IRONFLOW_ENCRYPTION_KEY` reads nothing the
+old one wrote. Before switching:
+
+1. **`enc:` references.** Decrypt each with the old key
+   (`ironflow secrets decrypt`) and encrypt it again with the new one
+   (`ironflow secrets encrypt`).
+2. **`encrypt_columns` output** written without its own `key:` was encrypted
+   with the platform key. Re-encrypt it, or keep the old key where that data
+   is read.
+3. **The audit trail.** Entries are keyed with a key derived from the platform
+   key, so under a new key every old entry reads as edited. Close the trail
+   first: verify it with the old key and record the head it prints, stop the
+   IronFlow processes, and move `audit.jsonl` and `audit.jsonl.head` aside
+   together into your archive. The first audited action under the new key
+   starts a new chain. The archived trail still verifies with the old key -
+   read from where you keep it, not typed where shell history keeps it:
+
+```bash
+IRONFLOW_ENCRYPTION_KEY="$(cat /secure/old-platform.key)" \
+IRONFLOW_AUDIT_FILE=/archive/audit-2026.jsonl \
+  ironflow state audit --expect-head <head-recorded-at-rotation>
 ```
 
 ### Recovering a failed run

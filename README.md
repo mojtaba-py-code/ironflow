@@ -1,14 +1,17 @@
-# IronFlow
+# Enterprise ETL Data Pipeline
 
-**An enterprise ETL data pipeline platform.** Pipelines are declared in YAML,
-executed as a dependency graph, and every stage — extraction, validation,
-transformation, loading — streams in bounded memory with a transactional
-destination.
+**IronFlow** — an enterprise ETL data pipeline platform. Pipelines are declared
+in YAML, executed as a dependency graph, and every stage — extraction,
+validation, transformation, loading — streams in bounded memory with a
+transactional destination. A pipeline file is treated as untrusted input from
+end to end.
 
 [![CI](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml/badge.svg)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
-[![Tests](https://img.shields.io/badge/tests-1015%20passing-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
-[![Branch coverage](https://img.shields.io/badge/branch%20coverage-90%25-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
+[![Security](https://github.com/mojtaba-py-code/ironflow/actions/workflows/security.yml/badge.svg)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/security.yml)
+[![CodeQL](https://github.com/mojtaba-py-code/ironflow/actions/workflows/codeql.yml/badge.svg)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/codeql.yml)
+[![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](https://www.python.org)
+[![Tests](https://img.shields.io/badge/tests-1443-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
+[![Branch coverage](https://img.shields.io/badge/branch%20coverage-91.5%25-brightgreen)](https://github.com/mojtaba-py-code/ironflow/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
@@ -22,18 +25,27 @@ exactly that.
 
 | Guarantee | How |
 |---|---|
-| **A failed run changes nothing** | The load engine owns the destination transaction. Nothing commits until the whole stream is consumed without error; any failure rolls back. Non-transactional destinations declare themselves and are flagged by `pipeline validate`. |
-| **Memory is a function of `batch_size`, not dataset size** | Every stage is a generator over record batches. Operations that genuinely cannot stream (sort, join, aggregate) are marked *blocking*, documented, and capped. |
-| **Bad data is quarantined, not lost** | Rejected records are routed to a reject destination together with the reason. Two circuit breakers (absolute count and error rate) abort a run whose data has gone systemically wrong. |
-| **Configuration is untrusted input** | Pipeline files are validated with Pydantic, expressions run in an AST sandbox, paths are confined to allow-listed roots, SQL identifiers are validated and values always bound, and outbound URLs pass an SSRF guard. |
+| **A failed run changes nothing** | The load engine owns the destination transaction. Nothing commits until the whole stream is consumed without error; any failure rolls back. With a quarantine, the commit is two-phase: both destinations prepare, the rejects publish first and the main data last, so a reject file that cannot be written fails the run before the main destination is touched. Non-transactional destinations declare themselves and are flagged by `pipeline validate`. |
+| **Memory is a function of `batch_size`, not dataset size** | Every stage is a generator over record batches, bounded by cells as well as rows, so a hostile file cannot widen a batch into gigabytes. Operations that genuinely cannot stream (sort, join, aggregate) are marked *blocking*, documented, and capped. |
+| **Bad data is quarantined, not lost** | Rejected records are routed to a reject destination together with the reason, and a reject that cannot be written fails the run rather than vanishing. Two circuit breakers (absolute count and error rate) abort a run whose data has gone systemically wrong. |
+| **Configuration is untrusted input** | Pipeline files are validated with Pydantic and bounded before they are built. Expressions run in an AST sandbox, paths are confined to allow-listed roots, SQL identifiers are validated and values always bound. What a pipeline may read from the environment and where it may connect are the operator's settings, which a pipeline can narrow and never widen. |
 
 ---
 
 ## Quick start
 
 ```bash
+git clone https://github.com/mojtaba-py-code/ironflow.git && cd ironflow
+```
+
+```bash
 pip install -e ".[columnar,excel,api]"
 ```
+
+IronFlow is not published on PyPI, and the `ironflow` package there is an
+unrelated project: install from this repository or from a
+[release wheel verified with `gh attestation verify`](docs/deployment.md#install),
+never by bare name.
 
 ```bash
 ironflow config init
@@ -230,23 +242,41 @@ Full detail in [docs/security.md](docs/security.md). The short version:
 
 - **No `eval`.** Expressions are parsed with `ast` and walked against an
   allow-list. Attribute access resolves through mappings, never `getattr`, so
-  `().__class__.__bases__` yields `None` instead of the type graph.
-- **SQL injection.** Values are always bound parameters; identifiers are
-  validated against `^[A-Za-z_][A-Za-z0-9_]*$` and quoted.
+  `().__class__.__bases__` yields `None` instead of the type graph. Powers are
+  sized before they are built, and regular expressions run on a time-bounded
+  engine, from literal patterns only.
+- **SQL injection.** Values are always bound parameters; identifiers must fully
+  match `[A-Za-z_][A-Za-z0-9_]{0,62}` and are quoted.
 - **Path traversal.** Every path is resolved (following symlinks) and asserted
-  to be inside an allow-listed data root.
-- **SSRF.** Outbound URLs are validated — scheme, host allow-list, and rejection
-  of private/loopback/link-local addresses — and every pagination hop and
-  redirect is re-validated.
+  to be inside an allow-listed data root - file by file inside a directory.
+- **What a pipeline can read.** `env:` and `${NAME}` reach only the variables the
+  operator allows, never IronFlow's own settings; `file:` only the operator's
+  secret directories.
+- **Where a pipeline can connect.** The SSRF policy is the operator's: private
+  destinations are opened by name or range, never from YAML, and cloud metadata
+  never. Every connection's address is re-checked at connect time (DNS
+  rebinding), every redirect and pagination hop is re-validated, credentials go
+  only to the origin they belong to, and response size is capped on decoded
+  bytes while the body streams.
 - **Secrets.** Pipeline files hold references (`env:`, `file:`, `enc:`), never
   values. Resolved secrets are wrapped in a `SecretStr` that renders as `***`.
 - **PII.** `mask_pii`, `hash_columns` (keyed HMAC) and `encrypt_columns` run
   before the load, so plaintext never reaches the destination.
-- **Audit.** Privileged actions are appended to a SHA-256 hash chain;
-  `ironflow state audit --verify` detects any edit or deletion.
+- **API.** Bearer tokens with an algorithm allow-list, pipeline scopes enforced
+  on every read, and a dashboard that needs a token like everything else.
+- **Audit.** Privileged actions are appended to a hash chain, keyed with the
+  platform key, whose head is anchored, so `ironflow state audit --verify`
+  detects an edit, a deletion - including of the last entries - or a missing
+  file. A head recorded off-host (`--expect-head`) also catches the log and its
+  anchor replaced together. The API, the scheduler and CLI runs can share the
+  trail without forking it.
 - **Production fails closed.** `Settings.validate_production_hardening()` blocks
-  start-up on missing auth, literal secrets, unconfined data roots or disabled
-  TLS.
+  start-up on missing auth, literal secrets, unconfined data roots, an
+  unrestricted environment or disabled TLS.
+- **Supply chain.** SHA-pinned actions, signed commits on a protected `main`,
+  gitleaks over the full history, a dependency audit that fails the build,
+  CodeQL, a Grype-scanned container, and releases with an SBOM and signed SLSA
+  provenance.
 
 ---
 
@@ -280,14 +310,22 @@ pip install -e ".[dev,columnar,excel,api]"
 ```
 
 ```bash
-make check     # lint + types + 1015 tests + secret scan, i.e. everything CI runs
+make check     # lint, types, tests and the secret scan - what CI runs
 ```
 
-**1015 tests, 90 % branch coverage** — and the numbers are enforced, not
-asserted: CI fails the build below 88 %, runs the suite on Python 3.11 and 3.12
-across Linux and Windows, installs without the optional extras to prove the slim
-path still imports, runs the integration tests against a real PostgreSQL, audits
-the dependency tree and builds the container image.
+**1,443 tests, 91.5 % branch coverage** — and the numbers are
+enforced, not asserted. CI fails the build below 89 %; runs the suite on Python
+3.11, 3.12, 3.13 and 3.14 on Linux, and on Windows and macOS, because path
+confinement is a security control and each platform resolves paths its own way;
+installs without the optional extras to prove the slim path still imports; runs
+the integration tests against a real PostgreSQL; and builds the container image
+and runs it read-only with every capability dropped.
+
+The security fixes are held to a stricter bar than coverage: each one has a
+regression test that reproduces the original attack, and each such test was
+confirmed to fail with its fix reverted. A separate workflow audits the
+dependency set, scans the whole git history for secrets and reviews every
+dependency a pull request adds; CodeQL and OpenSSF Scorecard run on every push.
 
 See [docs/](docs/) for the configuration reference, deployment guide, developer
 guide and troubleshooting notes; [CONTRIBUTING.md](CONTRIBUTING.md) for the

@@ -32,18 +32,24 @@ make coverage   # pytest with an HTML report in htmlcov/
 make security   # committed-secret scan, bandit rules, pip-audit
 ```
 
-CI additionally runs the suite on Python 3.11 and 3.12 across Linux and Windows,
-installs without the optional extras to prove the slim path still works, runs
-the integration tests against a real PostgreSQL, and builds the container image.
-Green locally does not mean green in CI — the cross-platform jobs exist because
-they have caught real bugs.
+CI additionally runs the suite on Python 3.11-3.14 on Linux and on Windows and
+macOS, installs without the optional extras to prove the slim path still works,
+runs the integration tests against a real PostgreSQL, and builds the container
+image, runs it read-only and scans it with Grype. A separate Security workflow
+audits the dependencies, scans the whole git history with gitleaks and reviews
+any dependency a pull request adds. Green locally does not mean green in CI —
+the cross-platform jobs exist because they have caught real bugs.
 
 ## What a change needs
 
 **A test that fails before it and passes after.** For a bug fix, write the
 failing test first; a fix with no test is a fix that comes back.
 
-**Coverage stays at or above 88 %** — CI enforces the floor. That is a floor,
+**A security fix needs a test that reproduces the attack** - the payload, the
+hostile response, the crafted file - and that test must be shown to fail with
+the fix reverted. A test that passes either way proves nothing about the fix.
+
+**Coverage stays at or above 89 %** — CI enforces the floor. That is a floor,
 not a target: a line executed by no assertion is not covered in any useful
 sense.
 
@@ -82,3 +88,7 @@ Do not open a public issue for a vulnerability. See [SECURITY.md](SECURITY.md).
 Write the commit subject in the imperative and say *why* in the body. Keep a
 pull request to one concern; two unrelated fixes are two pull requests. Update
 `CHANGELOG.md` under the appropriate heading for anything a user would notice.
+
+Commits must be signed (`git config commit.gpgsign true`, with a GPG or SSH
+key registered on GitHub): `main` rejects unsigned commits, force-pushes and
+deletion.

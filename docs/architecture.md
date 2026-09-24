@@ -91,8 +91,8 @@ one loop over each batch rather than ten.
 The load engine owns the destination's transaction boundary:
 
 ```
-open() → write(batch)* → commit()          success
-open() → write(batch)* → rollback()        any exception
+open() → write(batch)* → prepare() → commit()     success
+open() → write(batch)* → rollback()               any exception
 ```
 
 Nothing commits until the whole stream is consumed without error. For a
@@ -102,6 +102,22 @@ destination byte-identical to how it started.
 File sinks achieve this by staging: output goes to a sibling temporary file and
 is published in `commit()` with `Path.replace` (atomic on POSIX and Windows).
 `rollback()` deletes the staging file.
+
+A load with a quarantine has two destinations and no transaction spanning both,
+so the commit is **two-phase**. `prepare()` runs on both first and does
+everything that can fail - finishing, flushing and fsyncing the staged files,
+checking the targets can take them - while nothing is visible. Then the rejects
+publish, and the main data last: a reject file that cannot be written (open in
+Excel on Windows, a full disk) fails the run before the main destination is
+touched. If the main publish itself fails, an appending file sink withdraws the
+rejects it added, so a retry does not quarantine them twice. After the main
+commit nothing fails the task: a watermark that cannot be saved, or a source
+that fails to close, is logged - failing then would report a run whose rows are
+already published, and invite a retry that loads them again.
+
+Each sink declares the modes it can honour (`supported_modes`) and refuses the
+rest when it is built. `append` to a JSON array or an XML document used to
+produce a file no parser would open.
 
 SQL sinks wrap the whole load in one transaction. `mode: overwrite` issues
 `DELETE FROM` rather than `TRUNCATE`, because TRUNCATE is DDL on several engines

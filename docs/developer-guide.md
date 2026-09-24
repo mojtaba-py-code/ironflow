@@ -75,7 +75,13 @@ are load-bearing, not incidental.
    the resolver.
 4. **Resolve paths through the runtime.** `self.runtime.resolve_path(p)` applies
    the data-root confinement.
-5. **Validate URLs.** `validate_url(url, allow_private=...)`.
+5. **Make HTTP calls through `ironflow.security.net.build_client`**, with the
+   operator's `NetworkPolicy.from_settings(...)` narrowed by the connector's
+   options - never a bare `httpx.Client`. The guarded client re-checks every
+   connection's address (DNS rebinding), ignores proxy variables and follows no
+   redirects; read bodies with `read_capped`, and pass credentials per request,
+   only to the origin they belong to. `validate_url(url, policy=...)` gives an
+   early, readable error but is not the control on its own.
 6. **Never format values into SQL.** Bind them; validate identifiers.
 7. **Make `open`/`close` idempotent.** The base class handles the bookkeeping if
    you implement `_on_open`/`_on_close`.

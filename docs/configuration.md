@@ -64,14 +64,44 @@ the cascade on `task_runs`).
 |---|---|---|
 | `IRONFLOW_AUTH_ENABLED` | `false` | **Required true in production** |
 | `IRONFLOW_JWT_SECRET` | *(empty)* | ≥ 32 characters whenever auth is on, in **every** environment - start-up fails otherwise |
-| `IRONFLOW_JWT_ISSUER` / `_AUDIENCE` | `ironflow` / `ironflow-api` | Both enforced |
-| `IRONFLOW_ENCRYPTION_KEY` | *(empty)* | `ironflow secrets generate-key` |
+| `IRONFLOW_JWT_ISSUER` | `ironflow` | Enforced on every token |
+| `IRONFLOW_JWT_AUDIENCE` | `ironflow-api` | Enforced on every token |
+| `IRONFLOW_ENCRYPTION_KEY` | *(empty)* | `ironflow secrets generate-key`. Also keys the audit chain - see [rotating it](deployment.md#rotating-the-platform-key) before you change it |
 | `IRONFLOW_ALLOW_LITERAL_SECRETS` | `true` | Set false in production |
-| `IRONFLOW_ALLOW_PRIVATE_NETWORK` | `false` | This is the SSRF guard |
 | `IRONFLOW_AUDIT_ENABLED` | `true` | |
-| `IRONFLOW_AUDIT_FILE` | `$IRONFLOW_HOME/audit/audit.jsonl` | The hash-chained trail; put it on a volume that survives the container |
+| `IRONFLOW_AUDIT_FILE` | `$IRONFLOW_HOME/audit/audit.jsonl` | The hash-chained trail, with its head anchor in `<file>.head` and a `<file>.lock` its writers take turns on. Put it on a local volume that survives the container, and back up the log and `.head` together |
+| `IRONFLOW_MASK_PII_IN_REPORTS` | `true` | Masks detected PII in HTML/JSON run reports |
+
+### What a pipeline file may reach
+
+A pipeline file is untrusted input, so what it can read from the host and where
+it can connect is the operator's decision, made here. A pipeline can narrow any
+of these for itself; none of them can be widened from YAML.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `IRONFLOW_PIPELINE_ENV` | *(empty)* | Environment variables pipeline files may read through `${NAME}` and `env:NAME`, as glob patterns (`PG*,API_TOKEN`). Empty means any variable **except IronFlow's own settings**, which are never readable. **Required in production.** |
+| `IRONFLOW_SECRET_FILE_ROOTS` | *(empty)* | Directories `file:` references may read from, e.g. `/run/secrets`. Empty disables `file:` |
+| `IRONFLOW_ALLOW_PRIVATE_NETWORK` | `false` | Opens every private address to HTTP connectors - the SSRF guard off. Refused in production; a connector may switch it off for itself, never on |
+| `IRONFLOW_HTTP_PRIVATE_HOSTS` | *(empty)* | Specific private destinations HTTP connectors may reach: host names (and their subdomains) or CIDR ranges. How an internal API is reached in production. Link-local addresses (cloud metadata) are never reachable |
+| `IRONFLOW_HTTP_ALLOWED_HOSTS` | *(empty)* | If set, the **only** hosts (and subdomains) that HTTP connectors, OAuth2 token endpoints and webhook/Slack notifications may contact - the control that stops a pipeline from sending data somewhere nobody approved |
+
+### HTTP
+
+| Variable | Default | Notes |
+|---|---|---|
+| `IRONFLOW_HTTP_TIMEOUT` | `30` | Seconds, per connect/read |
 | `IRONFLOW_HTTP_VERIFY_TLS` | `true` | Cannot be false in production |
 | `IRONFLOW_HTTP_MAX_RETRIES` | `3` | Applies to 5xx/429 and transport errors only, never to a 4xx |
+| `IRONFLOW_HTTP_MAX_RESPONSE_BYTES` | `268435456` | Cap on a *decoded* response body, enforced while it streams |
+
+### API
+
+| Variable | Default | Notes |
+|---|---|---|
+| `IRONFLOW_API_HOST` | `127.0.0.1` | `0.0.0.0` only behind a proxy, with auth on |
+| `IRONFLOW_API_PORT` | `8080` | |
+| `IRONFLOW_API_CORS_ORIGINS` | *(empty)* | Comma-separated or a JSON array. Never used in credentials mode |
 
 Run `ironflow config check` to see what a given environment is missing.
 
@@ -109,7 +139,7 @@ failure mode that produces the "but I configured retries!" incident.
 
 | Form | Resolves from |
 |---|---|
-| `${VAR}` | environment |
+| `${VAR}` | environment, within `IRONFLOW_PIPELINE_ENV` |
 | `${var.name}` | the `variables:` block |
 | `${VAR:-fallback}` | environment, with a default |
 
@@ -117,6 +147,16 @@ A whole-string reference preserves type (`batch_size: "${BATCH}"` yields an
 int); an embedded one stringifies. An unresolved reference is an **error** with
 its location — so a missing production variable fails at load, not by writing to
 a path literally named `/data/${REGION}/out.csv`.
+
+Environment references pass the same policy as `env:` secrets: IronFlow's own
+settings (`IRONFLOW_JWT_SECRET`, `IRONFLOW_ENCRYPTION_KEY`, ...) are refused
+even when unset, and with `IRONFLOW_PIPELINE_ENV` configured nothing outside it
+resolves. An interpolated value lands in a plain field that the API, the
+dashboard and the logs show, so it must never be a secret - use `env:` in a
+secret-typed option instead.
+
+A file larger than 1 MiB, or whose YAML aliases would expand past 100,000
+nodes, is refused before it is built.
 
 ### Profiles
 
@@ -173,8 +213,26 @@ skip itself when its upstream produced nothing.
 Every connector takes `type` plus connector-specific keys. `ironflow connectors
 list` prints the live registry; each class docstring lists its options.
 
-Common to all: `name`, `mode` (`append` | `overwrite` | `upsert` |
-`error_if_exists`), `batch_size`, `retry`.
+Common to all: `name`, `mode`, `batch_size`, `retry`.
+
+`mode` is one of `append`, `overwrite`, `upsert`, `error_if_exists`, and each
+destination accepts only the modes it can honour - anything else is refused
+when the sink is built, so `pipeline validate` reports it:
+
+| Destination | Modes | Default |
+|---|---|---|
+| CSV, JSON Lines | `append`, `overwrite`, `error_if_exists` | `append` |
+| SQL (SQLite, PostgreSQL, MySQL) | all four | `append` |
+| JSON array, XML, Excel, Parquet | `overwrite`, `error_if_exists` | `overwrite` |
+| SFTP, FTP | `overwrite` | `overwrite` |
+| memory | `append`, `overwrite` | `append` |
+
+File sources bound what hostile input can cost: CSV refuses a header wider than
+`max_columns` (default 4096); CSV and Excel end a batch early once it holds
+`batch_size × 256` cells, so a very wide file yields more, smaller batches;
+Excel ignores cells to the right of the header; `skip_rows` is capped at
+1,000,000; XML and JSON honour `max_bytes`, and a whole JSON document (not JSON
+Lines) defaults to 100 MiB because it is parsed at once.
 
 ### Validation
 

@@ -21,10 +21,9 @@ Please give a fix a reasonable window before disclosing publicly.
 
 | Version | Supported |
 |---|---|
-| 1.0.x | yes |
-| < 1.0 | no |
-
-There is no < 1.0 in the wild: 1.0.0 is the first published release.
+| 1.1.x | yes |
+| 1.0.x | no - upgrade to 1.1, which fixes the defects listed in `CHANGELOG.md` |
+| < 1.0 | never released |
 
 ## Scope
 
@@ -35,46 +34,84 @@ upstream system. So the following are in scope and are treated as
 vulnerabilities:
 
 - code execution, filesystem access or network access reachable from a pipeline
-  YAML file (the expression sandbox, path confinement, the SSRF guard);
-- SQL injection through any connector option;
-- a secret reaching a log, a report, an API response or the audit trail in
-  plaintext;
-- authentication or authorisation bypass in the REST API;
-- a bound that can be exhausted from configuration — memory, CPU or response
-  size.
+  YAML file (the expression sandbox, path confinement, the network policy);
+- reading, from a pipeline file, anything the operator did not make available
+  to pipelines - an environment variable, a file, IronFlow's own settings;
+- SQL injection through any connector option other than the raw `query` and
+  `where` options, which are SQL by design and bounded by the database
+  account's grants;
+- a secret reaching a log, a report, an API response, a terminal or the audit
+  trail in plaintext;
+- authentication or authorisation bypass in the REST API, including reading a
+  pipeline outside the caller's scope;
+- a bound that can be exhausted from configuration or from the data a pipeline
+  reads - memory, CPU or response size;
+- tampering with the audit trail that `ironflow state audit --verify` does not
+  detect.
 
 Out of scope: anything that requires the attacker to already have write access
 to the host or to the environment the process runs in. Someone who can set
 `IRONFLOW_ENCRYPTION_KEY` does not need a vulnerability.
 
-## What the project already does
+## What the project does
 
-`docs/security.md` is the full threat model and the reasoning behind each
-control. In brief:
+`docs/security.md` is the full threat model, the reasoning behind each control,
+and a plain list of what the controls do *not* cover. In brief:
 
-- expressions are parsed with `ast` and walked against an allow-list — there is
-  no `eval`, and dotted access never reaches `getattr`;
-- SQL values are always bound; identifiers are validated against a strict
-  pattern and quoted;
+- expressions are parsed with `ast` and walked against an allow-list - there is
+  no `eval` - and regular expressions from pipeline files run on a time-bounded
+  engine;
+- SQL values are always bound; identifiers are validated and quoted;
 - every path is resolved through symlinks and asserted to sit inside an
   allow-listed root;
-- outbound URLs are checked for scheme, host allow-list and
-  private/loopback/link-local resolution — on the original URL and again on
-  every redirect and pagination hop;
+- what a pipeline may read from the environment (`IRONFLOW_PIPELINE_ENV`) and
+  from disk (`IRONFLOW_SECRET_FILE_ROOTS`), and where it may connect
+  (`IRONFLOW_HTTP_PRIVATE_HOSTS`, `IRONFLOW_HTTP_ALLOWED_HOSTS`), are the
+  operator's settings; a pipeline can narrow them and never widen them;
+- outbound HTTP is checked on the address each connection actually uses,
+  credentials go only to their own origin, and responses are size-capped while
+  they stream;
 - secrets live behind `env:` / `file:` / `enc:` references and are wrapped in a
   `SecretStr` that renders as `***`; a redaction filter runs on every log
   handler;
 - JWT verification checks the algorithm allow-list *before* verifying, compares
-  the signature in constant time, enforces `exp`/`nbf`/`iss`/`aud`, and refuses
-  an empty signing secret;
-- `Settings` refuses to construct with authentication enabled and a signing
-  secret under 32 characters, in **every** environment;
-- privileged actions are appended to a SHA-256 hash chain that
-  `ironflow state audit --verify` can check.
+  the signature in constant time, and enforces `exp`/`nbf`/`iss`/`aud`;
+  pipeline scopes hold on every API read;
+- privileged actions are appended to a keyed hash chain whose head is anchored,
+  which `ironflow state audit --verify` checks;
+- production refuses to start with authentication off, literal secrets allowed,
+  private networks open, unconfined data roots or an unrestricted environment.
 
 ## Automated checks
 
-Every push runs, in CI: ruff's bandit rules over the whole codebase,
-`scripts/check_secrets.py` (which fails the build on a credential-shaped
-literal), a `git grep` for committed credentials, and `pip-audit` against the
-dependency tree.
+Every push and pull request runs, and fails the build on a finding:
+
+- the test suite on Python 3.11-3.14 across Linux, Windows and macOS, including
+  a regression test for every security fix;
+- ruff's bandit rules (`S`) and strict mypy;
+- **CodeQL**'s security queries (also weekly);
+- **gitleaks** over every commit and the working tree, and
+  `scripts/check_secrets.py`;
+- **pip-audit** over the resolved dependency set of a full install (also
+  weekly), and dependency review on pull requests;
+- a container build that runs read-only with every capability dropped, scanned
+  by **Grype**;
+- **OpenSSF Scorecard** on every push to `main`.
+
+GitHub secret scanning with push protection, Dependabot security updates and
+private vulnerability reporting are enabled on the repository; `main` accepts
+no force-push, no deletion and no unsigned commit.
+
+## Verifying a release
+
+Release artifacts are built by `.github/workflows/release.yml` from the tagged
+commit, and each carries SLSA build provenance signed through Sigstore with
+that workflow's identity:
+
+```bash
+gh attestation verify ironflow-1.1.0-py3-none-any.whl --repo mojtaba-py-code/ironflow
+```
+
+Each release also includes a CycloneDX SBOM and a `SHA256SUMS` file.
+IronFlow is not published on PyPI - the `ironflow` package there is an
+unrelated project - so install from a verified release or from source.
