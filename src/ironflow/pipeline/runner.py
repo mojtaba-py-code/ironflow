@@ -136,7 +136,7 @@ class PipelineRunner:
                 )
 
         with context.bind(), ResourceMonitor() as resources:
-            self._start_history(pipeline, context, graph, trigger, principal)
+            run_id = self._start_history(pipeline, context, graph, trigger, principal)
             # Installed once the start is accepted, so a refused start cannot
             # leave SIGINT pointing at a run that never began.
             restore = self._install_signal_handlers(context) if install_signal_handlers else None
@@ -174,6 +174,7 @@ class PipelineRunner:
         result.resources = resources.to_dict()
         result.metrics_snapshot = self.metrics.snapshot()
         self._finish_history(result)
+        self._record_tasks(result, run_id, carried_over=completed)
         self._emit_completion(result)
         self._log_summary(result)
         return result
@@ -339,11 +340,12 @@ class PipelineRunner:
         graph: TaskGraph,
         trigger: str,
         principal: Principal | None,
-    ) -> None:
+    ) -> int | None:
+        """Record the start of the run; returns the row id task rows attach to."""
         if self.runs is None:
-            return
+            return None
         try:
-            self.runs.start_run(
+            return self.runs.start_run(
                 execution_id=context.execution_id,
                 pipeline_name=pipeline.name,
                 pipeline_version=pipeline.version,
@@ -361,6 +363,7 @@ class PipelineRunner:
             raise
         except IronFlowError:
             logger.warning("unable to record the start of this run", exc_info=True)
+            return None
 
     def _finish_history(self, result: PipelineResult) -> None:
         if self.runs is None:
@@ -380,6 +383,50 @@ class PipelineRunner:
             )
         except IronFlowError:
             logger.warning("unable to record the end of this run", exc_info=True)
+
+    def _record_tasks(
+        self, result: PipelineResult, run_id: int | None, *, carried_over: set[str]
+    ) -> None:
+        """Write the per-task rows that ``pipeline logs`` shows.
+
+        Written after the run row is finished, so a failure here cannot leave
+        the run marked RUNNING - the scheduler counts those against
+        ``max_concurrent_runs``.  Rows take the run's attempt number, so after a
+        resume each row says which attempt produced it; the task's own retries
+        go into ``details``.  Tasks ``carried_over`` from an earlier attempt are
+        not written again: the row from the attempt that ran them stands.
+        """
+        if self.runs is None or run_id is None:
+            return
+        for task in result.tasks:
+            if task.task_name in carried_over:
+                continue
+            details: dict[str, Any] = {}
+            if task.skipped_reason:
+                details["skipped_reason"] = task.skipped_reason
+            if task.attempt > 1:
+                details["retries"] = task.attempt - 1
+            try:
+                self.runs.record_task(
+                    run_id=run_id,
+                    execution_id=result.execution_id,
+                    task_name=task.task_name,
+                    status=task.status,
+                    started_at=task.started_at,
+                    finished_at=task.finished_at,
+                    duration_seconds=task.duration_seconds,
+                    rows_read=task.metrics.rows_in,
+                    rows_written=task.metrics.rows_out,
+                    rows_rejected=task.metrics.rows_failed,
+                    rows_skipped=task.metrics.rows_skipped,
+                    batches=task.metrics.batches,
+                    error=task.error,
+                    details=details,
+                )
+            except IronFlowError:
+                logger.warning(
+                    "unable to record task %r in the run history", task.task_name, exc_info=True
+                )
 
     def _emit_completion(self, result: PipelineResult) -> None:
         event = {

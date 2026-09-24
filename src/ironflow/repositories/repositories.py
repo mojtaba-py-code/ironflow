@@ -15,7 +15,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Collection, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import delete, func, select
@@ -163,7 +163,7 @@ class RunRepository(BaseRepository):
         execution_id: str,
         task_name: str,
         status: RunStatus,
-        attempt: int = 1,
+        attempt: int | None = None,
         duration_seconds: float = 0.0,
         rows_read: int = 0,
         rows_written: int = 0,
@@ -172,16 +172,29 @@ class RunRepository(BaseRepository):
         batches: int = 0,
         error: Exception | None = None,
         details: dict[str, Any] | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
     ) -> None:
+        """Record one task's outcome within a run.
+
+        ``attempt`` defaults to the run's current attempt, so the rows written
+        by a resume are told apart from those of the attempt it continues.
+        Without ``started_at``/``finished_at`` the task is taken to have just
+        finished; a caller recording after the fact passes the real times.
+        """
         with self.db.session() as session:
+            if attempt is None:
+                current = select(PipelineRun.attempt).where(PipelineRun.id == run_id)
+                attempt = session.scalar(current) or 1
+            finished = finished_at or utcnow()
             task = TaskRun(
                 run_id=run_id,
                 execution_id=execution_id,
                 task_name=task_name,
                 status=status.value,
                 attempt=attempt,
-                started_at=utcnow() - timedelta(seconds=duration_seconds),
-                finished_at=utcnow(),
+                started_at=started_at or finished - timedelta(seconds=duration_seconds),
+                finished_at=finished,
                 duration_seconds=duration_seconds,
                 rows_read=rows_read,
                 rows_written=rows_written,

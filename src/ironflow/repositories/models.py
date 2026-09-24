@@ -102,8 +102,10 @@ class PipelineRun(Base):
     metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Ordered by insertion, which is execution order within an attempt and
+    # attempt order across a resume; without it PostgreSQL may return any order.
     tasks: Mapped[list[TaskRun]] = relationship(
-        back_populates="run", cascade="all, delete-orphan", lazy="selectin"
+        back_populates="run", cascade="all, delete-orphan", lazy="selectin", order_by="TaskRun.id"
     )
 
     @property

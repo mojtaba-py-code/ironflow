@@ -1,4 +1,4 @@
-"""A resume stays inside its own pipeline.
+"""A resume stays inside its own pipeline, and every task leaves a record.
 
 ``pipeline resume`` accepted any execution id. Authorisation checked only the
 pipeline named on the command line, ``completed_tasks`` did not filter by
@@ -6,11 +6,15 @@ pipeline, and ``start_run`` took over the other pipeline's history row. An
 operator scoped to ``sales_*`` resumed ``sales_daily`` with an ``hr_payroll``
 execution id: the hr run record was rewritten (actor, attempt 2, rows 0) and
 sales_daily reported success having skipped the tasks hr had finished.
+
+``pipeline logs`` - documented as the per-task breakdown - always printed an
+empty table, because nothing ever called ``RunRepository.record_task``.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +29,10 @@ from ironflow.config.settings import reset_settings
 from ironflow.connectors.factory import ConnectorFactory
 from ironflow.connectors.memory import MemorySink, MemorySource
 from ironflow.core.errors import CheckpointError, ConfigurationError
+from ironflow.core.errors import ConnectionError as IFConnectionError
 from ironflow.core.types import RunStatus
 from ironflow.pipeline.runner import PipelineRunner
+from ironflow.pipeline.task import TaskExecutor
 from ironflow.repositories.repositories import CheckpointRepository, RunRepository
 from ironflow.security.rbac import OPERATOR, Principal
 
@@ -49,6 +55,12 @@ HR_PAYROLL: dict[str, Any] = {
                 "rules": [{"type": "not_null", "field": "id"}],
             },
             "destination": {"type": "memory", "buffer": "hr_out", "mode": "overwrite"},
+        },
+        {
+            "name": "publish",
+            "depends_on": ["load"],
+            "source": {"type": "memory", "records": [{"id": 1}]},
+            "destination": {"type": "memory", "buffer": "hr_published", "mode": "overwrite"},
         },
     ],
 }
@@ -197,6 +209,97 @@ class TestTheLayersBelowRefuseToo:
         assert (hr_checkpoint["pipeline"], hr_checkpoint["rows_processed"]) == ("hr_payroll", 2)
 
 
+def task_rows(service, execution_id: str) -> list[tuple[str, str, int]]:
+    """``(task, status, attempt)`` for every task row of a run, in order."""
+    return [
+        (row["task"], row["status"], row["attempt"])
+        for row in service.run_details(execution_id)["task_runs"]
+    ]
+
+
+def as_naive_utc(moment: datetime) -> datetime:
+    return moment.astimezone(UTC).replace(tzinfo=None) if moment.tzinfo else moment
+
+
+class TestTaskHistory:
+    def test_every_task_of_a_run_is_recorded(self, service, tmp_path):
+        write_pipelines(tmp_path / "pipelines")
+        result = service.run(service.get_pipeline("sales_daily"), install_signal_handlers=False)
+        assert task_rows(service, result.execution_id) == [
+            ("extract", "success", 1),
+            ("load", "success", 1),
+        ]
+        rows = service.run_details(result.execution_id)["task_runs"]
+        assert [(row["rows_read"], row["rows_written"]) for row in rows] == [(3, 3), (3, 3)]
+
+    def test_a_row_keeps_the_tasks_own_times(self, service, tmp_path):
+        """Written when the run ends, a row must not claim the task ended then."""
+        write_pipelines(tmp_path / "pipelines")
+        result = service.run(service.get_pipeline("sales_daily"), install_signal_handlers=False)
+        rows = service.run_details(result.execution_id)["task_runs"]
+        assert len(rows) == 2
+        for row in rows:
+            task = result.task(row["task"])
+            assert task is not None and task.finished_at is not None
+            recorded = (
+                as_naive_utc(datetime.fromisoformat(row["started_at"])),
+                as_naive_utc(datetime.fromisoformat(row["finished_at"])),
+            )
+            assert recorded == (as_naive_utc(task.started_at), as_naive_utc(task.finished_at))
+
+    def test_a_failed_task_is_recorded_with_its_error_and_what_it_stopped(
+        self, service, failed_hr_run
+    ):
+        rows = {row["task"]: row for row in service.run_details(failed_hr_run)["task_runs"]}
+        assert rows["extract"]["status"] == "success"
+        assert rows["load"]["status"] == "failed"
+        assert rows["load"]["error"]["code"] == "VALIDATION_FAILED"
+        assert "failed validation" in rows["load"]["error"]["message"]
+        assert rows["publish"]["status"] == "skipped"
+        assert rows["publish"]["details"] == {"skipped_reason": "an upstream task failed"}
+
+    def test_a_resume_records_its_own_attempt_and_nothing_twice(self, service, failed_hr_run):
+        """``extract`` finished in attempt 1; attempt 2 must not add a row for it."""
+        MemorySource.register("hr_rows", [{"id": 3}])
+        service.resume("hr_payroll", failed_hr_run)
+        assert task_rows(service, failed_hr_run) == [
+            ("extract", "success", 1),
+            ("load", "failed", 1),
+            ("publish", "skipped", 1),
+            ("load", "success", 2),
+            ("publish", "success", 2),
+        ]
+
+    def test_task_retries_are_kept_in_the_details(self, service, monkeypatch):
+        """The attempt column is the run's; the task's own retries must not be lost."""
+        flaky = PipelineSpec.model_validate(
+            {
+                "name": "flaky",
+                "tasks": [
+                    {
+                        "name": "load",
+                        "source": {"type": "memory", "records": [{"a": 1}]},
+                        "destination": {"type": "memory", "buffer": "flaky", "mode": "overwrite"},
+                        "retry": {"max_attempts": 3, "initial_delay": 0, "jitter": False},
+                    }
+                ],
+            }
+        )
+        calls = {"n": 0}
+        run_once = TaskExecutor._run_once
+
+        def fails_twice(executor, context, result):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise IFConnectionError("source unavailable")
+            return run_once(executor, context, result)
+
+        monkeypatch.setattr(TaskExecutor, "_run_once", fails_twice)
+        result = service.run(flaky, install_signal_handlers=False)
+        (row,) = service.run_details(result.execution_id)["task_runs"]
+        assert (row["status"], row["attempt"], row["details"]) == ("success", 1, {"retries": 2})
+
+
 class TestCli:
     runner = CliRunner()
 
@@ -229,3 +332,17 @@ class TestCli:
         assert "the execution is not a run of this pipeline" in result.stderr
         assert self.hr_run() == before
         assert MemorySink.buffer("sales_out") == []
+
+    def test_logs_shows_the_per_task_breakdown(self, workspace):
+        self.invoke("pipeline", "run", "hr_payroll")
+        execution_id = self.hr_run()["execution_id"]
+
+        result = self.invoke("pipeline", "logs", execution_id)
+        assert result.exit_code == 0
+        assert "record failed validation" in result.stdout, "the failing task's error"
+        payload = json.loads(self.invoke("--json", "pipeline", "logs", execution_id).stdout)
+        assert [(row["task"], row["status"]) for row in payload["task_runs"]] == [
+            ("extract", "success"),
+            ("load", "failed"),
+            ("publish", "skipped"),
+        ]
