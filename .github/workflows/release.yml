@@ -111,10 +111,12 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          # Literal prefix matches rather than regexes: the version's dots and
+          # the heading's brackets would otherwise need escaping twice over.
           awk -v ver="${VERSION}" '
-            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found && /^\[[^]]+\]: / { exit }
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found && index($0, "[") == 1 && index($0, "]: ") > 0 { exit }
             found { print }
           ' CHANGELOG.md > /tmp/notes.md
           test -s /tmp/notes.md || { echo "::error::CHANGELOG.md has no section for ${VERSION}"; exit 1; }
