@@ -6,25 +6,31 @@ moves CSV and SQL data does not carry ``pyarrow`` (~90 MB) in its image.
 
 Parquet
 -------
-Read row-group by row-group rather than whole-file, so memory stays bounded even
-for multi-gigabyte files.  Written through a staging file and published on
-commit, matching the transactional behaviour of the text sinks.
+Read in batches - a file row-group by row-group, a directory as a dataset
+scanned batch by batch - rather than whole, so memory stays bounded even for
+multi-gigabyte inputs.  Written through a staging file and published on commit,
+matching the transactional behaviour of the text sinks.
 
 Excel
 -----
 Read with ``openpyxl``'s ``read_only`` mode, which uses a streaming XML parser
-instead of building the whole workbook object graph.  On write, values that
-begin with a formula character are prefixed so an exported cell cannot execute
-as a formula, and ``write_only`` mode keeps memory flat.
+instead of building the whole workbook object graph; rows are read no wider
+than the header.  On write, values and header cells that begin with a formula
+character are prefixed so an exported cell cannot execute as a formula, and
+``write_only`` mode keeps memory flat.
 
 Excel's hard limit of 1,048,576 rows per sheet is enforced explicitly - silently
 truncating an export is far worse than failing it.
+
+Both formats are written whole, so neither can be appended to: their sinks
+support ``overwrite`` (the default) and ``error_if_exists``.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+import os
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
@@ -32,7 +38,14 @@ from typing import Any
 
 from ironflow.config.models import ConnectorSpec
 from ironflow.connectors.base import BaseSink, BaseSource, ConnectorRuntime, sink, source
-from ironflow.connectors.files import _FORMULA_PREFIXES, FileConnectorMixin
+from ironflow.connectors.files import (
+    _FORMULA_PREFIXES,
+    FileConnectorMixin,
+    _refuse_directory_target,
+    _report_unwithdrawable,
+    _rows_per_batch,
+    _xml_text,
+)
 from ironflow.core.context import ExecutionContext, new_id
 from ironflow.core.errors import ExtractionError, LoadingError
 from ironflow.core.types import DatasetSchema, LoadMode, Record, RecordBatch, RecordStream
@@ -60,10 +73,18 @@ def _require(module: str, extra: str) -> Any:
 # --------------------------------------------------------------------------- #
 @source("parquet")
 class ParquetSource(FileConnectorMixin, BaseSource):
-    """Read a Parquet file (or a directory of them) row-group at a time.
+    """Read a Parquet file, or a directory of them, in batches.
 
     Options: ``path`` (required), ``columns`` (projection pushdown).
+
+    A directory is read as a dataset - hive-style ``key=value`` sub-directories
+    become columns, names starting with ``.`` or ``_`` are skipped, as pyarrow
+    does - but its files are listed here and each one is confined to the data
+    roots before it is opened.  Confining only the directory let a symlink or
+    junction inside it read any file on the host.
     """
+
+    supports_incremental = False
 
     def read(self, context: ExecutionContext) -> RecordStream:
         pq = _require("pyarrow.parquet", "columnar")
@@ -72,32 +93,46 @@ class ParquetSource(FileConnectorMixin, BaseSource):
         batch_size = self.batch_size
 
         def generate() -> Iterator[RecordBatch]:
-            dataset = pq.ParquetFile(str(path)) if path.is_file() else None
-            sequence = 0
-            if dataset is not None:
-                # Projection is pushed into the reader: unread columns are never
-                # decompressed, which is the main reason to use Parquet at all.
-                for record_batch in dataset.iter_batches(batch_size=batch_size, columns=columns):
-                    context.cancellation.raise_if_cancelled()
-                    rows = record_batch.to_pylist()
-                    yield RecordBatch(rows, sequence=sequence, source=self.name)
-                    sequence += 1
+            # Projection is pushed into the reader: unread columns are never
+            # decompressed, which is the main reason to use Parquet at all.
+            if path.is_file():
+                batches = pq.ParquetFile(str(path)).iter_batches(
+                    batch_size=batch_size, columns=columns
+                )
             else:
-                table = pq.read_table(str(path), columns=columns)
-                for offset in range(0, table.num_rows, batch_size):
-                    context.cancellation.raise_if_cancelled()
-                    rows = table.slice(offset, batch_size).to_pylist()
-                    yield RecordBatch(rows, sequence=sequence, source=self.name)
-                    sequence += 1
+                # Minimal read-ahead: the defaults keep up to 16 batches of each
+                # of 4 files in flight, several times the memory batch_size promises.
+                batches = self._dataset(path).to_batches(
+                    columns=columns, batch_size=batch_size, batch_readahead=1, fragment_readahead=1
+                )
+            sequence = 0
+            for record_batch in batches:
+                context.cancellation.raise_if_cancelled()
+                if record_batch.num_rows == 0:
+                    continue
+                yield RecordBatch(record_batch.to_pylist(), sequence=sequence, source=self.name)
+                sequence += 1
 
         return generate()
+
+    def _dataset(self, directory: Path) -> Any:
+        ds = _require("pyarrow.dataset", "columnar")
+        files = _dataset_files(directory, self.runtime.resolve_path)
+        return ds.dataset(
+            [str(file) for file in files],
+            format="parquet",
+            # infer_dictionary matches what pq.read_table produced for a directory.
+            partitioning=ds.HivePartitioning.discover(infer_dictionary=True),
+            partition_base_dir=str(directory),
+        )
 
     def describe(self) -> DatasetSchema:
         pq = _require("pyarrow.parquet", "columnar")
         from ironflow.core.types import FieldSchema, FieldType
 
         path = self._resolve(must_exist=True)
-        arrow_schema = pq.read_schema(str(path))
+        # read_schema only takes a file; handed a directory it failed outright.
+        arrow_schema = pq.read_schema(str(path)) if path.is_file() else self._dataset(path).schema
         mapping = {
             "int": FieldType.INTEGER,
             "float": FieldType.FLOAT,
@@ -125,15 +160,45 @@ class ParquetSource(FileConnectorMixin, BaseSource):
         return None
 
 
+def _dataset_files(directory: Path, resolve: Callable[..., Path]) -> list[Path]:
+    """List a Parquet dataset's files, each resolved inside the data roots.
+
+    Walks like pyarrow's discovery - recursively, skipping names that start with
+    ``.`` or ``_`` (``_SUCCESS``, ``.crc``, ``_temporary/``) - and passes every
+    directory and file through ``resolve``, so a link pointing out of the roots
+    fails the read instead of being followed.  Resolved directories are
+    remembered, so a link back to an ancestor cannot make the walk endless.
+    """
+    files: list[Path] = []
+    visited: set[Path] = set()
+    for current, dirnames, filenames in os.walk(directory, followlinks=True):
+        real = resolve(current, must_exist=True)
+        if real in visited:
+            dirnames[:] = []
+            continue
+        visited.add(real)
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith((".", "_")))
+        files.extend(
+            resolve(Path(current) / name, must_exist=True)
+            for name in sorted(filenames)
+            if not name.startswith((".", "_"))
+        )
+    return files
+
+
 @sink("parquet")
 class ParquetSink(FileConnectorMixin, BaseSink):
     """Write Parquet with compression, staged and published on commit.
 
     Options: ``path`` (required), ``compression`` (default ``snappy``),
-    ``row_group_size``.
+    ``row_group_size``.  A Parquet file cannot be appended to - it would have to
+    be rewritten - so the modes are ``overwrite`` (the default) and
+    ``error_if_exists``; for incremental output write one file per run into a
+    partitioned directory.
     """
 
     transactional = True
+    supported_modes = frozenset({LoadMode.OVERWRITE, LoadMode.ERROR_IF_EXISTS})
 
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
@@ -141,19 +206,13 @@ class ParquetSink(FileConnectorMixin, BaseSink):
         self._target: Path | None = None
         self._staging: Path | None = None
         self._schema: Any = None
+        self._published = False
 
     def _on_open(self, context: ExecutionContext) -> None:
         target = self._resolve(must_exist=False)
         target.parent.mkdir(parents=True, exist_ok=True)
         if self.mode is LoadMode.ERROR_IF_EXISTS and target.exists():
             raise LoadingError("destination already exists", context={"path": str(target)})
-        if self.mode is LoadMode.APPEND and target.exists():
-            # Parquet files are immutable; appending means rewriting.
-            logger.warning(
-                "parquet does not support append; %s will be replaced. "
-                "Use a directory + date partition for incremental output.",
-                target.name,
-            )
         self._target = target
         self._staging = target.with_name(f".{target.name}.{new_id()}.staging")
         self.rows_written = 0
@@ -193,13 +252,18 @@ class ParquetSink(FileConnectorMixin, BaseSink):
         self.rows_written += len(batch)
         return len(batch)
 
-    def commit(self) -> None:
-
+    def prepare(self) -> None:
+        """Write the footer - the step that can still fail - without publishing."""
         if self._writer is not None:
             self._writer.close()
             self._writer = None
+        _refuse_directory_target(self._target)
+
+    def commit(self) -> None:
+        self.prepare()
         if self._staging is not None and self._staging.exists() and self._target is not None:
             self._staging.replace(self._target)  # atomic on POSIX and Windows
+            self._published = True
             logger.info("published %d rows to %s", self.rows_written, self._target.name)
 
     def rollback(self) -> None:
@@ -208,6 +272,7 @@ class ParquetSink(FileConnectorMixin, BaseSink):
             self._writer = None
         if self._staging is not None:
             self._staging.unlink(missing_ok=True)
+        _report_unwithdrawable(self, self._published, self._target)
         self.rows_written = 0
 
     def _on_close(self) -> None:
@@ -227,7 +292,12 @@ class ExcelSource(FileConnectorMixin, BaseSource):
 
     Options: ``path`` (required), ``sheet`` (name or index, default first),
     ``header_row`` (1-based, default 1), ``skip_rows``, ``columns``.
+
+    Records are exactly as wide as the header (or ``columns``): cells to its
+    right are ignored, as a CSV reader ignores fields beyond its header.
     """
+
+    supports_incremental = False
 
     def read(self, context: ExecutionContext) -> RecordStream:
         openpyxl = _require("openpyxl", "excel")
@@ -246,26 +316,29 @@ class ExcelSource(FileConnectorMixin, BaseSource):
             )
             try:
                 worksheet = _select_sheet(workbook, sheet_ref)
-                headers: list[str] = list(configured_columns)
+                headers = list(configured_columns) or _excel_headers(
+                    next(
+                        worksheet.iter_rows(
+                            min_row=header_row, max_row=header_row, values_only=True
+                        ),
+                        (),
+                    )
+                )
+                if not headers:
+                    _refuse_headerless(worksheet, header_row, path)
+                    return
+                rows_per_batch = _rows_per_batch(batch_size, len(headers))
                 buffer: list[Record] = []
                 sequence = 0
                 data_rows_seen = 0
 
-                # A single pass: rows before ``header_row`` are preamble, the
-                # header row supplies the column names (unless configured), the
-                # rest are data.
-                for index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                # openpyxl pads every row to the sheet's widest used column: one
+                # stray cell in column XFD made each record 16,384 keys wide.
+                # Bounding the read to the header keeps a record header-sized.
+                for row in worksheet.iter_rows(
+                    min_row=header_row + 1, max_col=len(headers), values_only=True
+                ):
                     context.cancellation.raise_if_cancelled()
-                    if index < header_row:
-                        continue
-                    if index == header_row and not configured_columns:
-                        headers = [
-                            str(cell).strip() if cell is not None else f"column_{position}"
-                            for position, cell in enumerate(row, start=1)
-                        ]
-                        continue
-                    if index == header_row and configured_columns:
-                        continue
                     if all(cell is None for cell in row):
                         continue
                     data_rows_seen += 1
@@ -274,17 +347,13 @@ class ExcelSource(FileConnectorMixin, BaseSource):
 
                     # Excel does not store trailing empty cells, so a short row
                     # is padded against the header to keep records rectangular.
-                    width = max(len(headers), len(row))
-                    record: Record = {}
-                    for position in range(width):
-                        name = (
-                            headers[position]
-                            if position < len(headers)
-                            else f"column_{position + 1}"
-                        )
-                        record[name] = _excel_value(row[position] if position < len(row) else None)
-                    buffer.append(record)
-                    if len(buffer) >= batch_size:
+                    buffer.append(
+                        {
+                            name: _excel_value(row[position] if position < len(row) else None)
+                            for position, name in enumerate(headers)
+                        }
+                    )
+                    if len(buffer) >= rows_per_batch:
                         yield RecordBatch(buffer, sequence=sequence, source=self.name)
                         sequence += 1
                         buffer = []
@@ -294,6 +363,35 @@ class ExcelSource(FileConnectorMixin, BaseSource):
                 workbook.close()
 
         return generate()
+
+
+def _excel_headers(cells: tuple[Any, ...]) -> list[str]:
+    """Column names from the header row, which openpyxl pads to the sheet width.
+
+    Trailing empty cells are that padding, not columns; an empty cell between
+    two names becomes ``column_<n>``.
+    """
+    width = len(cells)
+    while width and cells[width - 1] is None:
+        width -= 1
+    return [
+        str(cell).strip() if cell is not None else f"column_{position}"
+        for position, cell in enumerate(cells[:width], start=1)
+    ]
+
+
+def _refuse_headerless(worksheet: Any, header_row: int, path: Path) -> None:
+    """An empty header row is fine on an empty sheet and a mistake above data.
+
+    Without names there is no width to bound the rows by, and reading them
+    unbounded is exactly the padding problem the header width exists to stop.
+    """
+    if next(worksheet.iter_rows(min_row=header_row + 1, max_col=1, values_only=True), None):
+        raise ExtractionError(
+            "the header row is empty; set 'header_row' to the row holding the column "
+            "names, or list them in 'columns'",
+            context={"path": str(path), "header_row": header_row},
+        )
 
 
 def _select_sheet(workbook: Any, reference: Any) -> Any:
@@ -332,10 +430,13 @@ class ExcelSink(FileConnectorMixin, BaseSink):
     """Write a worksheet in write-only (streaming) mode.
 
     Options: ``path`` (required), ``sheet``, ``columns``, ``write_header``,
-    ``escape_formulas``, ``freeze_header``.
+    ``escape_formulas``, ``freeze_header``.  A workbook is written whole, so the
+    modes are ``overwrite`` (the default) and ``error_if_exists``; ``append``
+    used to replace the file without a word.
     """
 
     transactional = True
+    supported_modes = frozenset({LoadMode.OVERWRITE, LoadMode.ERROR_IF_EXISTS})
 
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
@@ -344,6 +445,7 @@ class ExcelSink(FileConnectorMixin, BaseSink):
         self._columns: list[str] = []
         self._target: Path | None = None
         self._staging: Path | None = None
+        self._published = False
 
     def _on_open(self, context: ExecutionContext) -> None:
         openpyxl = _require("openpyxl", "excel")
@@ -362,10 +464,13 @@ class ExcelSink(FileConnectorMixin, BaseSink):
         self._assert_writable()
         if batch.is_empty:
             return 0
+        escape = self.bool_option("escape_formulas", True)
         if not self._columns:
             self._columns = list(batch.columns())
             if self.bool_option("write_header", True):
-                self._worksheet.append(self._columns)
+                # Column names come from the data, and openpyxl stores any string
+                # starting with "=" as a live formula - header cells included.
+                self._worksheet.append([_excel_out(column, escape) for column in self._columns])
 
         if self.rows_written + len(batch) > EXCEL_MAX_ROWS:
             raise LoadingError(
@@ -373,7 +478,6 @@ class ExcelSink(FileConnectorMixin, BaseSink):
                 context={"limit": EXCEL_MAX_ROWS, "rows": self.rows_written + len(batch)},
             )
 
-        escape = self.bool_option("escape_formulas", True)
         for record in batch.records:
             self._worksheet.append(
                 [_excel_out(record.get(column), escape) for column in self._columns]
@@ -381,14 +485,20 @@ class ExcelSink(FileConnectorMixin, BaseSink):
         self.rows_written += len(batch)
         return len(batch)
 
-    def commit(self) -> None:
+    def prepare(self) -> None:
+        """Serialise the workbook to the staging file - the step that can fail."""
+        if self._workbook is not None and self._staging is not None:
+            self._workbook.save(str(self._staging))
+            self._workbook.close()
+            self._workbook = None
+        _refuse_directory_target(self._target)
 
-        if self._workbook is None or self._staging is None or self._target is None:
+    def commit(self) -> None:
+        self.prepare()
+        if self._staging is None or self._target is None or not self._staging.exists():
             return
-        self._workbook.save(str(self._staging))
-        self._workbook.close()
-        self._workbook = None
         self._staging.replace(self._target)  # atomic on POSIX and Windows
+        self._published = True
         logger.info("published %d rows to %s", self.rows_written, self._target.name)
 
     def rollback(self) -> None:
@@ -397,6 +507,7 @@ class ExcelSink(FileConnectorMixin, BaseSink):
             self._workbook = None
         if self._staging is not None:
             self._staging.unlink(missing_ok=True)
+        _report_unwithdrawable(self, self._published, self._target)
         self.rows_written = 0
 
     def _on_close(self) -> None:
@@ -408,12 +519,17 @@ class ExcelSink(FileConnectorMixin, BaseSink):
 
 
 def _excel_out(value: Any, escape_formulas: bool) -> Any:
-    """Coerce a value into something openpyxl accepts, neutralising formulas."""
+    """Coerce a value into something openpyxl accepts, neutralising formulas.
+
+    Characters XML 1.0 cannot carry are replaced first: openpyxl raises
+    ``IllegalCharacterError`` for a control character - after which the
+    write-only sheet is unusable - so one such value failed every retry.
+    """
     if value is None or isinstance(value, (int, float, bool, datetime, date, time)):
         return value
     if isinstance(value, Decimal):
         return float(value)
-    text = str(value) if not isinstance(value, (dict, list)) else _json(value)
+    text = _xml_text(str(value) if not isinstance(value, (dict, list)) else _json(value))
     if escape_formulas and text.startswith(_FORMULA_PREFIXES):
         return "'" + text
     return text

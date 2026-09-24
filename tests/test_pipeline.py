@@ -563,8 +563,10 @@ class TestLoadEngine:
         assert result.rows_written == 2
         assert not result.committed
 
-    def test_reject_failures_do_not_break_the_load(self, factory, context, caplog):
+    def test_reject_failures_fail_the_load(self, factory, context):
+        """Swallowing the error dropped the rows while the report counted them."""
         from ironflow.config.models import ConnectorSpec
+        from ironflow.core.errors import LoadingError
 
         sink = factory.create_sink(ConnectorSpec.model_validate({"type": "memory", "buffer": "m"}))
         rejects = factory.create_sink(
@@ -573,7 +575,6 @@ class TestLoadEngine:
         rejects.write = lambda *_: (_ for _ in ()).throw(RuntimeError("quarantine full"))
 
         engine = LoadEngine(sink, reject_sink=rejects, task_name="t")
-        with caplog.at_level("ERROR"):
-            count = engine.write_rejects([{"a": 1}], context)
-        assert count == 1
-        assert "quarantined" in caplog.text
+        with pytest.raises(LoadingError, match="quarantined"):
+            engine.write_rejects([{"a": 1}], context)
+        assert engine.result.rows_rejected == 1

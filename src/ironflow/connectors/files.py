@@ -4,9 +4,13 @@ Transactional file writes
 -------------------------
 File sinks stage output in a sibling temporary file and only publish it in
 :meth:`commit` - ``os.replace`` for overwrite (atomic on POSIX and on Windows),
-an append of the staged bytes for append mode.  A crash or a validation failure
+an append of the staged text for append mode.  A crash or a validation failure
 therefore leaves the previous file untouched instead of a half-written CSV that
-the next job happily consumes.  ``rollback`` just deletes the staging file.
+the next job happily consumes.  ``rollback`` deletes the staging file, and
+withdraws an append that was already published if a later destination in the
+same load fails.  Everything that can fail short of the publish - closing the
+document, flushing, fsync, opening the target for append - happens in
+:meth:`prepare`, before any destination of the load is published.
 
 Security
 --------
@@ -15,9 +19,12 @@ Security
 * XML is parsed with :mod:`defusedxml`, closing the billion-laughs / quadratic
   blowup / external-entity (XXE) class of attacks that the stock
   :mod:`xml.etree` parser is vulnerable to.
-* CSV writing escapes leading ``= + - @`` so a value like ``=cmd|'/c calc'!A1``
-  cannot become a formula when the export is opened in Excel (CSV injection).
-* Reads are size-capped so a hostile 500 GB file cannot fill the disk cache.
+* CSV writing escapes a leading ``= + - @``, TAB or CR - in values and in the
+  header, whose names come from the data too - so ``=cmd|'/c calc'!A1`` cannot
+  become a formula when the export is opened in Excel (CSV injection).
+* Reads are size-capped so a hostile 500 GB file cannot fill the disk cache,
+  and a delimited file's width is capped so a wide header cannot multiply the
+  memory of every short row padded against it.
 """
 
 from __future__ import annotations
@@ -27,8 +34,10 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 from collections.abc import Iterator
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +63,91 @@ csv.field_size_limit(min(10 * 1024 * 1024, sys.maxsize))
 #: Characters Excel interprets as the start of a formula.
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
+#: Default ``max_columns`` for delimited files: MySQL's hard limit and well past
+#: any real table.  Each short row is padded to the header's width, so without a
+#: cap a header of a million empty fields makes every one-byte row a
+#: million-key record.
+_DEFAULT_MAX_COLUMNS = 4096
+
+#: Cells a batch may hold for every row of ``batch_size``.  Delimited and
+#: spreadsheet records are rectangular - padded to the header - so a wide file
+#: multiplies the memory of every row; its batches are cut shorter to stay within
+#: ``batch_size * 256`` cells.  Files up to 256 columns wide get full batches.
+_CELLS_PER_BATCH_ROW = 256
+
+#: ``skip_rows`` discards preamble lines before the header; a million lines of
+#: preamble is not a preamble.
+_MAX_SKIP_ROWS = 1_000_000
+
+#: Default ``max_bytes`` for a JSON array or object.  The standard library cannot
+#: stream one, and the parsed document costs four to five times the file in
+#: memory, so the 5 GiB default of the streaming formats would be an OOM switch;
+#: this keeps a whole-document read to about half a gigabyte.
+_JSON_DOCUMENT_MAX_BYTES = 100 * 1024**2
+
+#: ``\uD800``-``\uDFFF`` escapes in JSON text: the only way a lone surrogate - a
+#: string no UTF-8 encoder, Arrow or database driver accepts - reaches a record.
+_SURROGATE_ESCAPE = re.compile(r"\\u[dD][89abcdefABCDEF]")
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+#: Characters XML 1.0 forbids anywhere in a document, escaped or not: C0 controls
+#: other than TAB/LF/CR, lone surrogates, and the non-characters U+FFFE/U+FFFF.
+_XML_ILLEGAL = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def _rows_per_batch(batch_size: int, width: int) -> int:
+    """Rows per batch for rectangular records ``width`` cells wide."""
+    return max(1, min(batch_size, batch_size * _CELLS_PER_BATCH_ROW // max(width, 1)))
+
+
+def _replace_lone_surrogates(value: Any) -> Any:
+    """Replace lone UTF-16 surrogates with U+FFFD throughout a decoded JSON value.
+
+    ``json.loads`` turns a legal ``"\\ud83d"`` escape into a code point that no
+    writer can encode: left in place, one such value fails the load on every
+    retry and blocks the feed.  U+FFFD is what the lenient byte decoding
+    (``errors="replace"``) already produces for undecodable input.
+    """
+    if isinstance(value, str):
+        return value if value.isascii() else _LONE_SURROGATE.sub("\ufffd", value)
+    if isinstance(value, dict):
+        return {
+            _replace_lone_surrogates(key): _replace_lone_surrogates(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_lone_surrogates(item) for item in value]
+    return value
+
+
+def _xml_text(text: str) -> str:
+    """Make ``text`` representable in XML 1.0 (and so in an .xlsx part).
+
+    Escaping cannot help here: ``&#1;`` is as ill-formed as the raw control
+    character.  The replacement is U+FFFD rather than nothing so the loss is
+    visible in the output.
+    """
+    return _XML_ILLEGAL.sub("\ufffd", text)
+
+
+def _refuse_directory_target(target: Path | None) -> None:
+    """Fail ``prepare`` - not the publish - when a directory occupies the target."""
+    if target is not None and target.is_dir():
+        raise LoadingError("destination path is a directory", context={"path": str(target)})
+
+
+def _report_unwithdrawable(sink: BaseSink, published: bool, target: Path | None) -> None:
+    """Log that a rolled-back sink had already replaced its target.
+
+    Reached when this sink is a load's reject destination: rejects are published
+    before the main data, and a replaced file cannot be put back if the main
+    publish then fails.  A retry replaces it again, so nothing accumulates.
+    """
+    if published and target is not None:
+        logger.warning(
+            "%s was already published to %s and cannot be withdrawn", sink.name, target.name
+        )
+
 
 class FileConnectorMixin:
     """Path resolution and encoding options shared by file connectors."""
@@ -77,9 +171,39 @@ class CsvSource(FileConnectorMixin, BaseSource):
     """Stream a delimited text file.
 
     Options: ``path`` (required), ``delimiter``, ``quotechar``, ``encoding``,
-    ``skip_rows``, ``columns`` (explicit header for headerless files),
-    ``has_header``, ``null_values``, ``strip_whitespace``, ``max_bytes``.
+    ``skip_rows`` (preamble lines before the header, at most 1,000,000),
+    ``columns`` (explicit header for headerless files), ``has_header``,
+    ``null_values``, ``strip_whitespace``, ``max_bytes``, ``max_columns``
+    (default 4096).
+
+    Memory per batch is bounded whatever the file's shape: the header may not be
+    wider than ``max_columns``, and batches of files wider than 256 columns are
+    cut proportionally shorter than ``batch_size``.
     """
+
+    supports_incremental = False
+
+    def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
+        super().__init__(spec, runtime)
+        # Checked here rather than at read time so ``pipeline validate`` reports them.
+        self._skip_rows()
+        self._max_columns()
+
+    def _skip_rows(self) -> int:
+        return self.int_option("skip_rows", 0, minimum=0, maximum=_MAX_SKIP_ROWS)
+
+    def _max_columns(self) -> int:
+        return self.int_option("max_columns", _DEFAULT_MAX_COLUMNS, minimum=1)
+
+    def _check_width(self, path: Path, fieldnames: Any) -> int:
+        width = len(fieldnames or ())
+        if width > self._max_columns():
+            raise ExtractionError(
+                "the CSV header has more columns than 'max_columns' allows; raise the "
+                "option if the file is genuinely this wide",
+                context={"path": str(path), "columns": width, "max_columns": self._max_columns()},
+            )
+        return width
 
     def read(self, context: ExecutionContext) -> RecordStream:
         path = self._resolve(must_exist=True)
@@ -94,7 +218,7 @@ class CsvSource(FileConnectorMixin, BaseSource):
         if len(delimiter) != 1:
             raise ConfigurationError("delimiter must be a single character")
         quotechar = self.str_option("quotechar", '"') or '"'
-        skip_rows = self.int_option("skip_rows", 0, minimum=0)
+        skip_rows = self._skip_rows()
         has_header = self.bool_option("has_header", True)
         columns = self.list_option("columns")
         nulls = set(self.list_option("null_values", ["", "NULL", "null", "NA", "N/A"]))
@@ -103,8 +227,7 @@ class CsvSource(FileConnectorMixin, BaseSource):
 
         def generate() -> Iterator[RecordBatch]:
             with path.open("r", encoding=self._encoding(), newline="", errors="replace") as handle:
-                for _ in range(skip_rows):
-                    handle.readline()
+                _skip_lines(handle, skip_rows, context)
 
                 reader = csv.DictReader(
                     handle,
@@ -116,13 +239,16 @@ class CsvSource(FileConnectorMixin, BaseSource):
                 )
                 if columns and has_header:
                     next(reader, None)  # explicit columns given: discard the header row
+                rows_per_batch = _rows_per_batch(
+                    batch_size, self._check_width(path, reader.fieldnames)
+                )
 
                 buffer: list[Record] = []
                 sequence = 0
                 for row in reader:
                     context.cancellation.raise_if_cancelled()
                     buffer.append(_clean_row(row, nulls=nulls, strip=strip))
-                    if len(buffer) >= batch_size:
+                    if len(buffer) >= rows_per_batch:
                         yield RecordBatch(buffer, sequence=sequence, source=self.name)
                         sequence += 1
                         buffer = []
@@ -138,11 +264,26 @@ class CsvSource(FileConnectorMixin, BaseSource):
         sample: list[Record] = []
         with path.open("r", encoding=self._encoding(), newline="", errors="replace") as handle:
             reader = csv.DictReader(handle, delimiter=delimiter)
+            self._check_width(path, reader.fieldnames)
             for index, row in enumerate(reader):
                 if index >= 200:
                     break
                 sample.append(dict(row))
         return infer_schema(sample)
+
+
+def _skip_lines(handle: io.TextIOWrapper, count: int, context: ExecutionContext) -> None:
+    """Discard up to ``count`` preamble lines.
+
+    This runs before the first batch - so before the task timeout is ever
+    checked - which is why it stops at end of file and polls for cancellation
+    instead of trusting ``count``.
+    """
+    for skipped in range(count):
+        if skipped % 1024 == 0:
+            context.cancellation.raise_if_cancelled()
+        if not handle.readline():
+            return
 
 
 def _clean_row(row: dict[str, Any], *, nulls: set[str], strip: bool) -> Record:
@@ -163,12 +304,27 @@ class _StagedFileSink(FileConnectorMixin, BaseSink):
     """Base for sinks that stage to a temp file and publish on commit."""
 
     transactional = True
+    supported_modes = frozenset({LoadMode.APPEND, LoadMode.OVERWRITE, LoadMode.ERROR_IF_EXISTS})
+
+    #: What happens to text the output encoding cannot represent - in UTF-8 only
+    #: a lone surrogate (a JSON ``\ud83d`` escape that reached the sink from a
+    #: source that does not clean them), in a legacy encoding anything outside
+    #: it.  ``strict`` failed the load on every retry of the same row and blocked
+    #: the feed; a backslash escape keeps the row, visibly, and inside a JSON
+    #: string it is exactly the JSON escape the value arrived as.
+    _encoding_errors = "backslashreplace"
 
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
         self._target: Path | None = None
         self._staging: Path | None = None
         self._handle: io.TextIOWrapper | None = None
+        self._append_handle: io.TextIOWrapper | None = None
+        #: Size of the target before our append started; set while an append
+        #: can still be withdrawn by truncating back to it.
+        self._append_offset: int | None = None
+        self._prepared = False
+        self._published = False
 
     def _on_open(self, context: ExecutionContext) -> None:
         target = self._resolve(must_exist=False)
@@ -181,30 +337,43 @@ class _StagedFileSink(FileConnectorMixin, BaseSink):
         self._target = target
         self._staging = target.with_name(f".{target.name}.{new_id()}.staging")
         self._handle = self._staging.open(
-            "w", encoding=self._encoding(), newline="", errors="strict"
+            "w", encoding=self._encoding(), newline="", errors=self._encoding_errors
         )
         self.rows_written = 0
 
-    def commit(self) -> None:
-        """Publish the staged file atomically."""
-        if self._handle is None or self._staging is None or self._target is None:
+    def _finish_document(self, handle: io.TextIOWrapper) -> None:
+        """Write whatever closes the document (a JSON array's ``]``, XML's end tag)."""
+
+    def prepare(self) -> None:
+        """Finish and fsync the staged file and make sure the target can take it."""
+        if self._prepared or self._handle is None or self._target is None:
             return
+        self._finish_document(self._handle)
         self._handle.flush()
         os.fsync(self._handle.fileno())
         self._handle.close()
         self._handle = None
 
+        _refuse_directory_target(self._target)
         if self.mode is LoadMode.APPEND and self._target.exists():
-            with (
-                self._staging.open("r", encoding=self._encoding()) as src,
-                self._target.open("a", encoding=self._encoding(), newline="") as dst,
-            ):
-                for chunk in iter(lambda: src.read(1024 * 1024), ""):
-                    dst.write(chunk)
-            self._staging.unlink(missing_ok=True)
+            # Opened now, not at publish time: a target that cannot be appended
+            # to (read-only, locked by another process on Windows) must fail
+            # while no destination of the load has been published yet.
+            self._append_handle = self._target.open("a", encoding=self._encoding(), newline="")
+        self._prepared = True
+
+    def commit(self) -> None:
+        """Publish the staged file: replace the target atomically, or append to it."""
+        self.prepare()
+        if not self._prepared or self._published:
+            return
+        assert self._staging is not None and self._target is not None
+        if self._append_handle is not None:
+            self._append_staged(self._append_handle)
         else:
             # Path.replace is os.replace: atomic on POSIX and on Windows.
             self._staging.replace(self._target)
+        self._published = True
 
         logger.info(
             "published %d rows to %s",
@@ -213,20 +382,59 @@ class _StagedFileSink(FileConnectorMixin, BaseSink):
             extra={"connector": self.name, "rows": self.rows_written},
         )
 
+    def _append_staged(self, target: io.TextIOWrapper) -> None:
+        assert self._staging is not None
+        self._append_offset = os.fstat(target.fileno()).st_size
+        # newline="" on the read side too: universal-newline decoding turned the
+        # CRLF inside a quoted CSV field into LF, altering appended values.
+        with self._staging.open("r", encoding=self._encoding(), newline="") as staged:
+            for chunk in iter(lambda: staged.read(1024 * 1024), ""):
+                target.write(chunk)
+        target.flush()
+        os.fsync(target.fileno())
+        target.close()
+        self._append_handle = None
+        self._staging.unlink(missing_ok=True)
+
     def rollback(self) -> None:
-        """Discard the staged file; the destination is untouched."""
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
+        """Discard the staged file and withdraw an append this sink published.
+
+        The load engine publishes the reject destination before the main one;
+        if the main publish then fails, this is what takes the appended rejects
+        back out, so a retry does not append them a second time.  A replaced
+        file cannot be withdrawn - the previous version is gone - and says so.
+        """
+        self._close_handles()
+        if self._append_offset is not None and self._target is not None:
+            os.truncate(self._target, self._append_offset)
+            self._append_offset = None
+            logger.warning(
+                "%s: withdrew the %d rows it had appended to %s",
+                self.name,
+                self.rows_written,
+                self._target.name,
+            )
+        else:
+            _report_unwithdrawable(self, self._published, self._target)
         if self._staging is not None:
             self._staging.unlink(missing_ok=True)
             logger.warning("rolled back %d staged rows for %s", self.rows_written, self.name)
         self.rows_written = 0
 
+    def _close_handles(self) -> None:
+        for handle in (self._handle, self._append_handle):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    # Closing flushes; after a failed write (a full disk) that
+                    # fails again.  The descriptor is released regardless.
+                    logger.debug("closing a handle of %s failed", self.name, exc_info=True)
+        self._handle = None
+        self._append_handle = None
+
     def _on_close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
+        self._close_handles()
         # A staging file still present at close means neither commit nor
         # rollback ran (hard failure); do not leave litter behind.
         if self._staging is not None and self._staging.exists():
@@ -294,7 +502,12 @@ class CsvSink(_StagedFileSink):
         )
         write_header = self.bool_option("write_header", True)
         if write_header and not (self.mode is LoadMode.APPEND and self.target_exists_and_nonempty):
-            self._writer.writeheader()
+            # Column names come from the data - a CSV header, JSON keys - so they
+            # are as untrusted as the values and get the same neutralisation.
+            escape = self.bool_option("escape_formulas", True)
+            self._writer.writerow(
+                {column: _csv_value(column, "", escape) for column in self._columns}
+            )
 
     def commit(self) -> None:
         if self._dropped_columns:
@@ -329,11 +542,22 @@ def _csv_value(value: Any, null_value: str, escape_formulas: bool) -> str:
 # --------------------------------------------------------------------------- #
 @source("json", "jsonl", "ndjson")
 class JsonSource(FileConnectorMixin, BaseSource):
-    """Read JSON Lines (streaming) or a JSON array/object (buffered).
+    """Read JSON Lines (streaming) or a JSON array/object (whole document).
 
     Options: ``path`` (required), ``format`` (``lines``|``array``|``auto``),
-    ``root`` (dotted path to the array inside an object), ``encoding``.
+    ``root`` (dotted path to the array inside an object), ``encoding``,
+    ``strict``, ``max_bytes``.
+
+    JSON Lines is the streaming format: memory follows ``batch_size``.  A JSON
+    array or object cannot be streamed with the standard library - it is parsed
+    whole, at four to five times the file size in memory - so its ``max_bytes``
+    defaults to 100 MiB instead of 5 GiB.  Convert large exports to JSON Lines.
+
+    Lone surrogates (``"\\ud83d"``, legal JSON that no encoder accepts) are
+    replaced with U+FFFD as the file is decoded.
     """
+
+    supports_incremental = False
 
     def read(self, context: ExecutionContext) -> RecordStream:
         path = self._resolve(must_exist=True)
@@ -370,6 +594,8 @@ class JsonSource(FileConnectorMixin, BaseSource):
                             ) from exc
                         logger.warning("skipping malformed JSON at line %d", line_number)
                         continue
+                    if _SURROGATE_ESCAPE.search(text):
+                        record = _replace_lone_surrogates(record)
                     buffer.append(_as_record(record))
                     if len(buffer) >= batch_size:
                         yield RecordBatch(buffer, sequence=sequence, source=self.name)
@@ -382,19 +608,24 @@ class JsonSource(FileConnectorMixin, BaseSource):
 
     def _read_array(self, path: Path, context: ExecutionContext) -> RecordStream:
         size = path.stat().st_size
-        limit = self._max_bytes()
+        limit = self.int_option("max_bytes", _JSON_DOCUMENT_MAX_BYTES, minimum=1)
         if size > limit:
             raise ExtractionError(
                 "JSON array files are read into memory; file exceeds max_bytes. "
                 "Convert the export to JSON Lines to stream it.",
                 context={"path": str(path), "size": size, "limit": limit},
             )
+        # errors="replace" as for JSON Lines: one undecodable byte must not fail
+        # every run of the feed with a raw UnicodeDecodeError.
+        text = path.read_text(encoding=self._encoding(), errors="replace")
         try:
-            payload = json.loads(path.read_text(encoding=self._encoding()))
+            payload = json.loads(text)
         except json.JSONDecodeError as exc:
             raise ExtractionError(
                 "file is not valid JSON", context={"path": str(path)}, cause=exc
             ) from exc
+        has_surrogates = _SURROGATE_ESCAPE.search(text) is not None
+        del text  # the parsed payload is the only copy worth keeping
 
         root = self.str_option("root", "")
         if root:
@@ -412,8 +643,14 @@ class JsonSource(FileConnectorMixin, BaseSource):
         def generate() -> Iterator[RecordBatch]:
             for index in range(0, len(records), batch_size):
                 context.cancellation.raise_if_cancelled()
-                chunk = [_as_record(item) for item in records[index : index + batch_size]]
-                yield RecordBatch(chunk, sequence=index // batch_size, source=self.name)
+                chunk = records[index : index + batch_size]
+                if has_surrogates:
+                    chunk = [_replace_lone_surrogates(item) for item in chunk]
+                yield RecordBatch(
+                    [_as_record(item) for item in chunk],
+                    sequence=index // batch_size,
+                    source=self.name,
+                )
 
         return generate()
 
@@ -427,11 +664,13 @@ def _as_record(value: Any) -> Record:
 
 @sink("json", "jsonl", "ndjson")
 class JsonSink(_StagedFileSink):
-    """Write JSON Lines (default) or a JSON array.
+    """Write JSON Lines or a JSON array.
 
     Options: ``path`` (required), ``format``, ``indent``, ``ensure_ascii``.
-    JSON Lines is the default because it appends and streams; a JSON array
-    cannot be appended to without rewriting the file.
+    JSON Lines (``.jsonl``/``.ndjson`` or ``format: lines``) appends and
+    streams.  A JSON array cannot be appended to without rewriting the file -
+    appending produced ``[...][...]`` - so it supports ``overwrite`` (its
+    default) and ``error_if_exists`` only.
     """
 
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
@@ -445,6 +684,11 @@ class JsonSink(_StagedFileSink):
             return fmt
         path = str(self.option("path", ""))
         return "lines" if path.lower().endswith((".jsonl", ".ndjson")) else "array"
+
+    def accepted_modes(self) -> frozenset[LoadMode]:
+        if self._format == "array":
+            return frozenset({LoadMode.OVERWRITE, LoadMode.ERROR_IF_EXISTS})
+        return self.supported_modes
 
     def _on_open(self, context: ExecutionContext) -> None:
         super()._on_open(context)
@@ -476,10 +720,9 @@ class JsonSink(_StagedFileSink):
         self.rows_written += len(batch)
         return len(batch)
 
-    def commit(self) -> None:
-        if self._format == "array" and self._handle is not None:
-            self._handle.write("]")
-        super().commit()
+    def _finish_document(self, handle: io.TextIOWrapper) -> None:
+        if self._format == "array":
+            handle.write("]")
 
 
 # --------------------------------------------------------------------------- #
@@ -490,12 +733,17 @@ class XmlSource(FileConnectorMixin, BaseSource):
     """Stream records out of an XML document.
 
     Options: ``path`` (required), ``record_tag`` (required), ``attributes``
-    (include element attributes, default true), ``text_key``.
+    (include element attributes, default true), ``text_key``, ``max_bytes``.
 
-    Parsed with ``defusedxml`` and freed incrementally: each matched element is
-    cleared after conversion so peak memory stays proportional to one record,
-    not to the document.
+    Parsed with ``defusedxml`` and freed incrementally: once a record has been
+    converted - or any element outside a record has ended - it is cleared *and*
+    detached from its parent, so peak memory stays proportional to one record,
+    not to the document.  ``clear()`` alone empties an element but leaves it
+    attached, and a million emptied records hanging off the root is still a
+    million objects.
     """
+
+    supports_incremental = False
 
     def read(self, context: ExecutionContext) -> RecordStream:
         try:
@@ -506,6 +754,12 @@ class XmlSource(FileConnectorMixin, BaseSource):
             ) from exc
 
         path = self._resolve(must_exist=True)
+        size = path.stat().st_size
+        if size > self._max_bytes():
+            raise ExtractionError(
+                "source file exceeds the configured size limit",
+                context={"path": str(path), "size": size, "limit": self._max_bytes()},
+            )
         record_tag = self.str_option("record_tag", required=True)
         include_attributes = self.bool_option("attributes", True)
         text_key = self.str_option("text_key", "#text")
@@ -514,17 +768,29 @@ class XmlSource(FileConnectorMixin, BaseSource):
         def generate() -> Iterator[RecordBatch]:
             buffer: list[Record] = []
             sequence = 0
-            # ``end`` events only: the element is complete and safe to convert.
-            for _event, element in iterparse(str(path), events=("end",)):
-                if _local_name(element.tag) != record_tag:
+            ancestors: list[Any] = []  # the open elements; the last is the parent
+            open_records = 0
+            for event, element in iterparse(str(path), events=("start", "end")):
+                is_record = _local_name(element.tag) == record_tag
+                if event == "start":
+                    ancestors.append(element)
+                    if is_record:
+                        open_records += 1
                     continue
-                context.cancellation.raise_if_cancelled()
-                buffer.append(
-                    _element_to_record(
-                        element, include_attributes=include_attributes, text_key=text_key
+                ancestors.pop()
+                if is_record:
+                    open_records -= 1
+                    context.cancellation.raise_if_cancelled()
+                    buffer.append(
+                        _element_to_record(
+                            element, include_attributes=include_attributes, text_key=text_key
+                        )
                     )
-                )
-                element.clear()  # release the subtree immediately
+                elif open_records:
+                    continue  # a field of a record still being parsed
+                element.clear()
+                if ancestors:
+                    ancestors[-1].remove(element)
                 if len(buffer) >= batch_size:
                     yield RecordBatch(buffer, sequence=sequence, source=self.name)
                     sequence += 1
@@ -581,15 +847,28 @@ class XmlSink(_StagedFileSink):
     """Write records as a simple XML document.
 
     Options: ``path`` (required), ``root_tag``, ``record_tag``.
-    Values are escaped with :func:`xml.sax.saxutils.escape`; element names are
-    sanitised so a hostile column name cannot inject markup.
+    The output is always well-formed: values are escaped with
+    :func:`xml.sax.saxutils.escape` after characters XML 1.0 cannot carry at all
+    (``\\x01``, lone surrogates) are replaced with U+FFFD, and every element
+    name - columns, ``record_tag`` and ``root_tag`` alike - is sanitised so a
+    hostile name cannot inject markup.  A document cannot be appended to, so
+    the modes are ``overwrite`` (the default) and ``error_if_exists``.
     """
+
+    supported_modes = frozenset({LoadMode.OVERWRITE, LoadMode.ERROR_IF_EXISTS})
+    #: Character references are XML's own lossless escape for a character the
+    #: file's encoding lacks.
+    _encoding_errors = "xmlcharrefreplace"
+
+    @property
+    def _root_tag(self) -> str:
+        return _safe_tag(self.str_option("root_tag", "records"))
 
     def _on_open(self, context: ExecutionContext) -> None:
         super()._on_open(context)
         assert self._handle is not None
         self._handle.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        self._handle.write(f"<{self.str_option('root_tag', 'records')}>\n")
+        self._handle.write(f"<{self._root_tag}>\n")
 
     def write(self, batch: RecordBatch, context: ExecutionContext) -> int:
         from xml.sax.saxutils import escape
@@ -602,25 +881,50 @@ class XmlSink(_StagedFileSink):
             self._handle.write(f"  <{record_tag}>\n")
             for key, value in record.items():
                 tag = _safe_tag(key)
-                text = "" if value is None else escape(str(value))
+                text = "" if value is None else escape(_xml_text(str(value)))
                 self._handle.write(f"    <{tag}>{text}</{tag}>\n")
             self._handle.write(f"  </{record_tag}>\n")
 
         self.rows_written += len(batch)
         return len(batch)
 
-    def commit(self) -> None:
-        if self._handle is not None:
-            self._handle.write(f"</{self.str_option('root_tag', 'records')}>\n")
-        super().commit()
+    def _finish_document(self, handle: io.TextIOWrapper) -> None:
+        handle.write(f"</{self._root_tag}>\n")
 
 
+@lru_cache(maxsize=4096, typed=True)
 def _safe_tag(name: str) -> str:
-    """Coerce an arbitrary column name into a valid XML element name."""
+    """Coerce an arbitrary column name into a valid XML element name.
+
+    Cached: it runs for every key of every record, over a handful of names.
+    """
     cleaned = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(name))
     if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
         cleaned = f"_{cleaned}"
-    return cleaned[:100]
+    cleaned = cleaned[:100]
+    if not cleaned.isascii() and not _is_xml_name(cleaned):
+        # ``str.isalnum`` is Unicode-wide and XML's name rules are narrower: a
+        # superscript digit, the micro sign or a titlecase digraph passes the
+        # first and fails the parser.  Keep any name the parser accepts - accented
+        # Latin, CJK - and fall back to ASCII for the rest.  The first character
+        # is already a letter or "_", so it stays a valid name start.
+        cleaned = "".join(c if c.isascii() else "_" for c in cleaned)
+    return cleaned
+
+
+def _is_xml_name(name: str) -> bool:
+    """True when the XML parser accepts ``name`` as an element name.
+
+    ``name`` only holds letters, digits and ``._-`` here, so the probe document
+    cannot contain markup of its own.
+    """
+    from defusedxml.ElementTree import ParseError, fromstring
+
+    try:
+        fromstring(f"<{name}/>")
+    except ParseError:
+        return False
+    return True
 
 
 __all__ = [

@@ -254,20 +254,11 @@ class TestColumnarEdgeCases:
         sink.rollback()
         sink.close()
 
-    def test_parquet_append_warns(self, factory, tmp_path: Path, context, caplog):
+    def test_parquet_append_is_refused(self, factory, tmp_path: Path):
+        """A Parquet file cannot be appended to; 'append' used to replace it."""
         pytest.importorskip("pyarrow")
-        target = tmp_path / "d.parquet"
-        first = factory.create_sink(spec("parquet", path=str(target)))
-        first.open(context)
-        first.write(RecordBatch([{"a": 1}]), context)
-        first.commit()
-        first.close()
-
-        second = factory.create_sink(spec("parquet", path=str(target), mode="append"))
-        with caplog.at_level("WARNING"):
-            second.open(context)
-        second.close()
-        assert "does not support append" in caplog.text
+        with pytest.raises(ConfigurationError, match="does not support mode 'append'"):
+            factory.create_sink(spec("parquet", path=str(tmp_path / "d.parquet"), mode="append"))
 
     def test_parquet_error_if_exists(self, factory, tmp_path: Path, context):
         pytest.importorskip("pyarrow")

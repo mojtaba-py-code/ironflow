@@ -74,10 +74,11 @@ class MemorySink(BaseSink):
 
     Transactional in the useful sense: rows land in a pending buffer and only
     move to :attr:`records` on commit, so a test can assert that a failed run
-    published nothing.
+    published nothing.  Supports ``append`` and ``overwrite``.
     """
 
     transactional = True
+    supported_modes = frozenset({LoadMode.APPEND, LoadMode.OVERWRITE})
 
     #: Named buffers so a test can read results after the pipeline closed.
     _buffers: ClassVar[dict[str, list[Record]]] = {}

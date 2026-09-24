@@ -177,11 +177,11 @@ class TaskExecutor:
             stream = self._build_stream(source, context, deadline)
             load_result = self._load_engine.load(stream, context)
         finally:
-            source.close()
+            self._close_source(source)
 
         # The watermark advances only after the destination has committed.
         if load_result.committed or context.dry_run:
-            self.extraction.commit_watermark(context)
+            self._commit_watermark(context, committed=load_result.committed)
 
         result.metrics.rows_in = self.extraction.state.rows_read
         result.metrics.rows_out = load_result.rows_written
@@ -194,6 +194,41 @@ class TaskExecutor:
         if not self.extraction.state.schema_diff.is_empty:
             result.schema_drift = self.extraction.state.schema_diff.to_dict()
         return result
+
+    @staticmethod
+    def _close_source(source: BaseSource) -> None:
+        """Close the source without letting a close error decide the outcome.
+
+        After a committed load, raising here would report a failed run whose
+        rows are published - and a retry would load them again.  After a failed
+        load it would replace the error that explains the failure.
+        """
+        try:
+            source.close()
+        except Exception:
+            logger.warning("closing source %s failed", source.name, exc_info=True)
+
+    def _commit_watermark(self, context: ExecutionContext, *, committed: bool) -> None:
+        """Advance the watermark; after a commit, a failure here is only logged.
+
+        The destination's commit is the point of no return.  Failing the task
+        now would report a failed run that changed the destination and invite a
+        retry that loads the same rows again; instead the next run re-reads from
+        the previous mark, which an upsert or overwrite destination absorbs and
+        an append destination does not - hence the error.
+        """
+        try:
+            self.extraction.commit_watermark(context)
+        except Exception:
+            if not committed:
+                raise
+            logger.error(
+                "task %r committed its rows but the watermark could not be saved; the "
+                "next run will re-read from the previous watermark %r",
+                self.task.name,
+                self.extraction.state.previous_watermark,
+                exc_info=True,
+            )
 
     def _build_stream(
         self, source: BaseSource, context: ExecutionContext, deadline: float | None

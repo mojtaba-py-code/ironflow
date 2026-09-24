@@ -39,7 +39,7 @@ from typing import Any
 from ironflow.config.models import TaskSpec
 from ironflow.connectors.base import BaseSource
 from ironflow.core.context import ExecutionContext
-from ironflow.core.errors import ExtractionError, SchemaError
+from ironflow.core.errors import ConfigurationError, ExtractionError, SchemaError
 from ironflow.core.events import EventType
 from ironflow.core.types import (
     DatasetSchema,
@@ -108,6 +108,15 @@ class ExtractionEngine:
         """Resolve the starting watermark and push it into the source spec."""
         if not self.is_incremental or self.task.incremental is None:
             return
+        if not source.supports_incremental:
+            # Before anything is read: the source would ignore the watermark, and
+            # every "incremental" run would silently be a full load.
+            raise ConfigurationError(
+                f"strategy {self.strategy.value!r} needs a source that can filter on "
+                f"the watermark; a {source.spec.type!r} source re-reads its whole input "
+                "on every run. Use 'strategy: full' with an overwrite or upsert destination",
+                context={"task": self.task.name, "source": source.name},
+            )
 
         incremental = self.task.incremental
         previous = None

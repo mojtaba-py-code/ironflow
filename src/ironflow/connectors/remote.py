@@ -42,7 +42,7 @@ from ironflow.core.errors import (
 )
 from ironflow.core.errors import ConnectionError as IFConnectionError
 from ironflow.core.retry import call_with_retry
-from ironflow.core.types import RecordBatch, RecordStream
+from ironflow.core.types import LoadMode, RecordBatch, RecordStream
 from ironflow.security.guards import safe_filename
 
 logger = logging.getLogger(__name__)
@@ -138,6 +138,8 @@ class SftpSource(_StagingMixin, BaseSource):
     option accepted by the delegated file connector.
     """
 
+    supports_incremental = False
+
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
         self._staging_dir: Path | None = None
@@ -200,10 +202,13 @@ class SftpSink(_StagingMixin, BaseSink):
     """Write locally, then upload over SSH on commit.
 
     Uploading only at commit time means a failed or rolled-back run never
-    publishes a partial file to the remote system.
+    publishes a partial file to the remote system.  The upload replaces the
+    remote file, so ``overwrite`` is the only mode: ``append`` used to be
+    accepted and replaced the file all the same.
     """
 
     transactional = True
+    supported_modes = frozenset({LoadMode.OVERWRITE})
 
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
@@ -228,7 +233,9 @@ class SftpSink(_StagingMixin, BaseSink):
             {
                 "type": connector_type,
                 "name": f"{self.name}:staged",
-                "mode": self.spec.mode,
+                # Always overwrite: the upload replaces the remote file, so the
+                # local copy is written whole whatever its format.
+                "mode": self.mode,
                 "path": str(self._local_path),
             }
         )
@@ -247,10 +254,15 @@ class SftpSink(_StagingMixin, BaseSink):
         self.rows_written += written
         return written
 
+    def prepare(self) -> None:
+        """Finish the local file; the upload in ``commit`` is the only remote effect."""
+        if self._delegate is not None:
+            self._delegate.commit()
+
     def commit(self) -> None:
         if self._delegate is None or self._local_path is None:
             return
-        self._delegate.commit()
+        self.prepare()
         remote_path = self.str_option("remote_path", required=True)
         call_with_retry(
             lambda: self._upload(self._local_path, remote_path),  # type: ignore[arg-type]
@@ -364,6 +376,8 @@ class FtpSource(_StagingMixin, BaseSource):
     ``remote_path`` (required), ``format``, ``tls``, ``passive``.
     """
 
+    supports_incremental = False
+
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
         self._staging_dir: Path | None = None
@@ -415,9 +429,13 @@ class FtpSource(_StagingMixin, BaseSource):
 
 @sink("ftp", "ftps")
 class FtpSink(_StagingMixin, BaseSink):
-    """Write locally then upload over FTPS on commit."""
+    """Write locally then upload over FTPS on commit.
+
+    ``STOR`` replaces the remote file, so ``overwrite`` is the only mode.
+    """
 
     transactional = True
+    supported_modes = frozenset({LoadMode.OVERWRITE})
 
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
@@ -442,7 +460,7 @@ class FtpSink(_StagingMixin, BaseSink):
             {
                 "type": connector_type,
                 "name": f"{self.name}:staged",
-                "mode": self.spec.mode,
+                "mode": self.mode,  # effective mode, as for SFTP
                 "path": str(self._local_path),
             }
         )
@@ -461,10 +479,15 @@ class FtpSink(_StagingMixin, BaseSink):
         self.rows_written += written
         return written
 
+    def prepare(self) -> None:
+        """Finish the local file; the upload in ``commit`` is the only remote effect."""
+        if self._delegate is not None:
+            self._delegate.commit()
+
     def commit(self) -> None:
         if self._delegate is None or self._local_path is None:
             return
-        self._delegate.commit()
+        self.prepare()
         remote_path = self.str_option("remote_path", required=True)
         connection = _ftp_connect(self)
         try:

@@ -18,6 +18,23 @@ before the incident, not during it.
 
 Dry runs read, transform and validate everything but never open the destination,
 which makes ``--dry-run`` a genuine rehearsal rather than a syntax check.
+
+Two destinations, one outcome
+-----------------------------
+A load with a quarantine has two destinations to publish, and no transaction
+spans both.  The commit is therefore two-phase.  ``prepare`` runs on both first
+and does everything that can fail - finishing, flushing and syncing the staged
+files, checking the targets can take them - while nothing is visible.  Then the
+rejects are published, and the main data last: a reject file that cannot be
+written (open in Excel on Windows, a directory in the way, a full disk) fails
+the run before the main destination is touched.  If the main publish itself
+fails, the rejects are withdrawn where the sink can (an append is truncated back
+off), so a retry does not quarantine the same rows twice.  Either way a run that
+reports failure has not published its main data - which would otherwise stay
+put with the watermark not advanced, and be loaded a second time by the re-run.
+
+The quarantine is part of the transaction in the other direction too: a reject
+that cannot be written fails the load instead of being logged and dropped.
 """
 
 from __future__ import annotations
@@ -123,10 +140,11 @@ class LoadEngine:
     def write_rejects(self, records: list[Record], context: ExecutionContext) -> int:
         """Route quarantined records to the reject destination.
 
-        A failure here is logged, not raised: losing the quarantine copy is bad,
-        but failing an otherwise healthy load because the quarantine table is
-        full is worse.  The count is still recorded, so the discrepancy is
-        visible in the run report.
+        A failure here fails the load, and so rolls the main destination back.
+        It used to be logged and swallowed, which let the run succeed and
+        advance the watermark past rows that were then in neither destination -
+        quarantine silently turned into ``drop``, while the report still counted
+        them as rejected.
         """
         if not records:
             return 0
@@ -140,13 +158,15 @@ class LoadEngine:
                 self.reject_sink.open(context)
                 self._reject_opened = True
             self.reject_sink.write(RecordBatch(records, source="quarantine"), context)
-        except Exception:
-            logger.error(
-                "unable to write %d quarantined record(s) to %s",
-                len(records),
-                self.reject_sink.name,
-                exc_info=True,
-            )
+        except LoadingError as exc:
+            exc.with_context(task=self.task_name, quarantine=self.reject_sink.name)
+            raise
+        except Exception as exc:
+            raise LoadingError(
+                f"unable to write quarantined records to {self.reject_sink.name!r}",
+                context={"task": self.task_name, "rows": len(records)},
+                cause=exc,
+            ) from exc
         return len(records)
 
     # -- internals --------------------------------------------------------- #
@@ -176,10 +196,18 @@ class LoadEngine:
             )
 
     def _commit(self) -> None:
+        """Prepare every destination, then publish the rejects and the main data last.
+
+        The order is the guarantee described in the module docstring: nothing
+        after the main publish can fail the load.
+        """
+        destinations = [self.reject_sink] if self.reject_sink and self._reject_opened else []
         if self.sink is not None:
-            self.sink.commit()
-        if self.reject_sink is not None and self._reject_opened:
-            self.reject_sink.commit()
+            destinations.append(self.sink)
+        for sink in destinations:
+            sink.prepare()
+        for sink in destinations:
+            sink.commit()
         self.result.committed = True
 
     def _rollback(self, exc: BaseException) -> None:

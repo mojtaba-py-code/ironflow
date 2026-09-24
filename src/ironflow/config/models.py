@@ -73,7 +73,14 @@ class ConnectorSpec(OpenModel):
 
     type: str = Field(description="Registered connector type, e.g. 'csv' or 'postgres'.")
     name: str | None = None
-    mode: LoadMode = LoadMode.APPEND
+    mode: LoadMode | None = Field(
+        default=None,
+        description=(
+            "How a destination treats existing data. Omitted: 'append' where the "
+            "destination can append, otherwise 'overwrite'. A mode the destination "
+            "does not implement is refused when it is built, not reinterpreted."
+        ),
+    )
     batch_size: int | None = Field(default=None, ge=1, le=1_000_000)
     retry: RetrySpec | None = None
 

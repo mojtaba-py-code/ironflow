@@ -12,9 +12,10 @@ Every connector receives two objects:
     without touching the environment, and what guarantees every connector shares
     the same security policy.
 
-Lifecycle is ``open -> read``/``write* -> commit|rollback -> close``, mirroring a
-database transaction.  Sinks that cannot be transactional (a REST endpoint)
-implement ``commit``/``rollback`` as documented no-ops rather than pretending.
+Lifecycle is ``open -> read``/``write* -> [prepare] -> commit|rollback -> close``,
+mirroring a database transaction.  Sinks that cannot be transactional (a REST
+endpoint) implement ``commit``/``rollback`` as documented no-ops rather than
+pretending.
 """
 
 from __future__ import annotations
@@ -199,6 +200,12 @@ class BaseConnector(abc.ABC):
 class BaseSource(BaseConnector, abc.ABC):
     """Base class for data sources."""
 
+    #: False for sources that re-read their whole input on every run (files) and
+    #: so cannot apply the watermark an incremental strategy pushes into them.
+    #: The extraction engine refuses that combination: accepting it made every
+    #: "incremental" run a silent full load, duplicating an append destination.
+    supports_incremental: bool = True
+
     @abc.abstractmethod
     def read(self, context: ExecutionContext) -> RecordStream:
         """Yield batches lazily."""
@@ -214,24 +221,46 @@ class BaseSource(BaseConnector, abc.ABC):
 
 
 class BaseSink(BaseConnector, abc.ABC):
-    """Base class for destinations."""
+    """Base class for destinations.
+
+    Commit is two-phase so that a load can publish the main and the reject
+    destination together: :meth:`prepare` does everything that can fail
+    (finishing, flushing and syncing the staged output, checking the target can
+    take it) while nothing is visible yet, and :meth:`commit` is left with the
+    publish itself.  See :mod:`ironflow.pipeline.loading` for why that matters.
+    """
 
     #: True when ``rollback`` genuinely undoes writes.  Surfaced by
     #: ``ironflow pipeline validate`` so operators know which destinations can
     #: leave partial data behind on failure.
     transactional: bool = False
 
+    #: The ``mode`` values this destination implements.  Anything else is refused
+    #: when the sink is built - which is what ``ironflow pipeline validate`` does -
+    #: instead of being reinterpreted at run time: an "append" that replaced a
+    #: Parquet file, or glued a second document onto a JSON array or an XML file.
+    supported_modes: frozenset[LoadMode] = frozenset(LoadMode)
+
     def __init__(self, spec: ConnectorSpec, runtime: ConnectorRuntime | None = None) -> None:
         super().__init__(spec, runtime)
         self.rows_written = 0
+        self._check_mode()
 
     @abc.abstractmethod
     def write(self, batch: RecordBatch, context: ExecutionContext) -> int:
         """Write a batch; return the number of rows accepted."""
         raise NotImplementedError
 
+    def prepare(self) -> None:
+        """Phase one of commit: make the writes durable without publishing them.
+
+        Idempotent, and implied by :meth:`commit`.  Default no-op: a destination
+        whose publish is a single atomic step (a database ``COMMIT``) has nothing
+        to do ahead of it.
+        """
+
     def commit(self) -> None:
-        """Make writes durable.  Default no-op for non-transactional sinks."""
+        """Publish the writes.  Default no-op for non-transactional sinks."""
 
     def rollback(self) -> None:
         """Undo writes since the last commit.  Default no-op."""
@@ -242,9 +271,36 @@ class BaseSink(BaseConnector, abc.ABC):
                 self.rows_written,
             )
 
+    def accepted_modes(self) -> frozenset[LoadMode]:
+        """Modes valid for this configuration; a JSON sink's depend on its format."""
+        return self.supported_modes
+
     @property
     def mode(self) -> LoadMode:
-        return self.spec.mode
+        """The configured mode, or this destination's own default when none is set.
+
+        The default is ``append`` where the destination can append and
+        ``overwrite`` where it cannot, so leaving ``mode`` out never asks a
+        whole-document format for an append it would get wrong.
+        """
+        if self.spec.mode is not None:
+            return self.spec.mode
+        if LoadMode.APPEND in self.accepted_modes():
+            return LoadMode.APPEND
+        return LoadMode.OVERWRITE
+
+    def _check_mode(self) -> None:
+        requested = self.spec.mode
+        if requested is None or requested in self.accepted_modes():
+            return
+        raise ConfigurationError(
+            f"destination type {self.spec.type!r} does not support mode {requested.value!r}",
+            context={
+                "connector": self.name,
+                "mode": requested.value,
+                "supported": sorted(mode.value for mode in self.accepted_modes()),
+            },
+        )
 
     def _assert_writable(self) -> None:
         if not self._opened:
