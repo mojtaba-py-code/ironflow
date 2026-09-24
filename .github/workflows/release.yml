@@ -1,0 +1,130 @@
+# Publishes a GitHub release for a version tag (vX.Y.Z), with artifacts anyone
+# can verify came from this workflow at that commit:
+#
+#   gh attestation verify ironflow-X.Y.Z-py3-none-any.whl --repo mojtaba-py-code/ironflow
+#
+# The attestation is SLSA build provenance, signed through Sigstore with this
+# workflow's OIDC identity - there is no long-lived signing key to steal.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, SBOM and provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # sign the provenance with this workflow's identity
+      attestations: write # store it where `gh attestation verify` looks
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: The tag must match the package version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^__version__ = "([^"]+)"$/\1/p' src/ironflow/version.py)
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject version ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the sdist and wheel
+        run: |
+          python -m pip install "build==1.6.1"
+          python -m build
+
+      - name: Install the wheel into a clean environment and run it
+        run: |
+          python -m venv /tmp/wheel-check
+          /tmp/wheel-check/bin/python -m pip install dist/*.whl
+          /tmp/wheel-check/bin/ironflow version
+
+      - name: Software bill of materials (CycloneDX)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python -m pip install "cyclonedx-bom==7.4.0"
+          cyclonedx-py environment /tmp/wheel-check/bin/python --output-reproducible \
+            --of JSON -o "dist/ironflow-${VERSION}.cdx.json"
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.cdx.json
+
+      - name: Checksums, and the provenance bundle beside the artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "${BUNDLE}" "dist/ironflow-${VERSION}.sigstore.json"
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  publish:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v ver="${VERSION}" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/notes.md
+          test -s /tmp/notes.md || { echo "::error::CHANGELOG.md has no section for ${VERSION}"; exit 1; }
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Enterprise ETL Data Pipeline ${GITHUB_REF_NAME}" \
+            --notes-file /tmp/notes.md \
+            --verify-tag

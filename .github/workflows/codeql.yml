@@ -7,9 +7,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
   schedule:
     # Weekly, so a query pattern published after this code was written is still
     # applied to it.
@@ -23,12 +23,15 @@ jobs:
   analyze:
     name: Analyze (python)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       # Required to upload the SARIF results to the Security tab.
       security-events: write
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9

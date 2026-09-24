@@ -3,28 +3,45 @@
 # reachable from the data a pipeline processes rather than only from the host.
 version: 2
 updates:
+  # Runtime dependencies keep permissive lower bounds on purpose: raising a
+  # `>=` floor narrows the install matrix without fixing anything, and CI
+  # already installs the newest resolvable versions on every run. So routine
+  # version PRs are limited to the development toolchain. Security fixes are
+  # not limited by this list - they arrive as Dependabot *security* updates,
+  # which are driven by advisories rather than by the allow-list below.
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
-    labels: ["dependencies"]
+    allow:
+      - dependency-name: "pytest*"
+      - dependency-name: "ruff"
+      - dependency-name: "mypy"
+      - dependency-name: "coverage*"
+      - dependency-name: "types-*"
     groups:
-      # One PR for routine bumps keeps the queue reviewable; security updates
-      # still arrive on their own.
-      python-minor-and-patch:
-        update-types: ["minor", "patch"]
+      dev-tooling:
+        patterns: ["*"]
+    labels: ["dependencies"]
 
+  # Every action is pinned to a commit SHA; this keeps the pins current.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
     labels: ["dependencies", "ci"]
 
-  # The image is built from docker/Dockerfile, so the base image is watched
-  # there rather than at the repository root.
+  # The base image is pinned by digest in docker/Dockerfile. Digest refreshes
+  # (the same Python and Debian, patched) arrive weekly; moving to a new Python
+  # minor or a new Debian release is a decision, not a bot PR.
   - package-ecosystem: docker
     directory: "/docker"
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     labels: ["dependencies", "docker"]

@@ -1,0 +1,12 @@
+# gitleaks configuration, used by the Security workflow on every commit in the
+# history and on the working tree.
+#
+# The upstream rule set is used in full: this file adds nothing to it and
+# disables none of it. It only records strings in this repository that look
+# like credentials to a scanner and are not, so the scan is deterministic
+# instead of depending on an entropy threshold. Every entry is an exact literal
+# or a tightly anchored pattern, so a real credential committed next to one of
+# them is still reported.
+
+[extend]
+useDefault = true

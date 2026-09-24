@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +15,8 @@ env:
   PYTHONUNBUFFERED: "1"
   FORCE_COLOR: "1"
 
+# Every job reads the repository and nothing else. A job that needs more asks
+# for it by name, so a compromised step inherits no write access.
 permissions:
   contents: read
 
@@ -22,8 +24,13 @@ jobs:
   lint:
     name: Lint and types
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      # persist-credentials: false on every checkout - no later step has any
+      # reason to hold the job token in .git/config.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -46,13 +53,26 @@ jobs:
   test:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Windows and macOS each resolve paths their own way - drive letters
+          # and UNC prefixes, /var -> /private/var - and path confinement is a
+          # security control here, so both run the whole suite.
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -68,7 +88,7 @@ jobs:
 
       - name: Enforce coverage floor
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
-        run: coverage report --fail-under=88
+        run: coverage report --fail-under=89
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
@@ -81,8 +101,11 @@ jobs:
   minimal-install:
     name: Slim install (no optional extras)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -103,16 +126,18 @@ jobs:
 
       - name: Core suites must pass without extras
         run: pytest tests/test_core.py tests/test_security.py tests/test_expressions.py
-             tests/test_config.py tests/test_orchestration.py -q
+             tests/test_config.py tests/test_orchestration.py tests/test_pipeline_confinement.py -q
 
   integration:
     name: PostgreSQL integration
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
         env:
           POSTGRES_USER: ironflow
+          # A throwaway service container that lives for this job only.
           POSTGRES_PASSWORD: ironflow
           POSTGRES_DB: ironflow
         options: >-
@@ -124,6 +149,8 @@ jobs:
           - 5432:5432
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -139,42 +166,15 @@ jobs:
           IRONFLOW_STATE_DATABASE_URL: postgresql+psycopg://ironflow:ironflow@localhost:5432/ironflow
         run: pytest -m integration -q
 
-  security:
-    name: Security scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install
-        run: |
-          pip install -e ".[dev,columnar,excel,remote,api]"
-          pip install pip-audit
-
-      # ruff's bandit rules (S) run in the lint job; this is the dependency side.
-      - name: Audit dependencies for known vulnerabilities
-        run: pip-audit --strict --desc
-        continue-on-error: true   # advisory: a new CVE must not block an unrelated PR
-
-      - name: Fail on committed secrets
-        run: |
-          if git grep -nIE '(IRONFLOW_ENCRYPTION_KEY|JWT_SECRET|PASSWORD)[[:space:]]*=[[:space:]]*[A-Za-z0-9+/=_-]{12,}' \
-             -- ':!*.example' ':!docs/*' ':!tests/*' ':!.github/*'; then
-            echo "::error::a credential-shaped literal was committed"
-            exit 1
-          fi
-
   docker:
     name: Docker image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [lint]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -189,7 +189,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test the image
+      # The restrictions production should apply, so an image that quietly
+      # needs a writable root, root privileges or a capability fails here.
+      - name: Smoke test under production restrictions
         run: |
-          docker run --rm ironflow:ci version
-          docker run --rm ironflow:ci connectors list
+          set -euo pipefail
+          hardened=(--rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges)
+          docker run "${hardened[@]}" ironflow:ci version
+          docker run "${hardened[@]}" ironflow:ci connectors list
+          test "$(docker run --rm --entrypoint id ironflow:ci -u)" = "1001"
+
+      # Grype rather than Trivy: Trivy's GitHub Actions had 76 of 77 version
+      # tags force-pushed to a credential stealer in March 2026. Fails on any
+      # high or critical vulnerability that already has a fix.
+      - name: Scan the image for known vulnerabilities
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ironflow:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
