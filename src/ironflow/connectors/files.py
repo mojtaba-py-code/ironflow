@@ -95,7 +95,9 @@ _XML_ENCODING_NAME = re.compile(r"[A-Za-z][A-Za-z0-9._-]*")
 
 #: Characters XML 1.0 forbids anywhere in a document, escaped or not: C0 controls
 #: other than TAB/LF/CR, lone surrogates, and the non-characters U+FFFE/U+FFFF.
-_XML_ILLEGAL = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+#: Listed rather than written as the complement of the legal ranges: that form
+#: needs astral ranges, which UTF-16-based analysers split into surrogate pairs.
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def _rows_per_batch(batch_size: int, width: int) -> int:
