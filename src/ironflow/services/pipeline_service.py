@@ -139,12 +139,20 @@ class PipelineService:
                     f"task {task.name!r} source: {p}"
                     for p in self.factory.validate(task.source, kind="source")
                 )
+                problems.extend(self._incremental_problems(task))
             if task.destination is not None:
                 problems.extend(
                     f"task {task.name!r} destination: {p}"
                     for p in self.factory.validate(task.destination, kind="sink")
                 )
                 warnings.extend(self._destination_warnings(task))
+            # Built here too, so an unsupported mode on the quarantine surfaces
+            # before a run rather than when the first reject arrives.
+            if task.reject_destination is not None:
+                problems.extend(
+                    f"task {task.name!r} reject destination: {p}"
+                    for p in self.factory.validate(task.reject_destination, kind="sink")
+                )
 
             if (
                 task.validation
@@ -183,6 +191,25 @@ class PipelineService:
             "warnings": warnings,
             "structure": structure,
         }
+
+    @staticmethod
+    def _incremental_problems(task: Any) -> list[str]:
+        """The run refuses incremental on a source that ignores watermarks;
+        `validate` says so first, without opening anything."""
+        from ironflow.connectors.base import SOURCE_REGISTRY
+        from ironflow.core.types import LoadStrategy
+
+        if task.strategy not in (LoadStrategy.INCREMENTAL, LoadStrategy.CDC):
+            return []
+        if task.source.type not in SOURCE_REGISTRY:
+            return []  # reported already, as an unknown source type
+        if getattr(SOURCE_REGISTRY.get(task.source.type), "supports_incremental", True):
+            return []
+        return [
+            f"task {task.name!r}: strategy {task.strategy.value!r} needs a source that "
+            f"filters on the watermark; a {task.source.type!r} source re-reads its whole "
+            "input on every run"
+        ]
 
     def _destination_warnings(self, task: Any) -> list[str]:
         warnings: list[str] = []

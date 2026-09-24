@@ -65,7 +65,7 @@ ANCHOR_SUFFIX = ".head"
 
 _AUDIT_KEY_CONTEXT = b"ironflow-audit-chain-v1"
 _ANCHOR_MAC_CONTEXT = "ironflow-audit-head-v1"
-_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_HASH_RE = re.compile(r"[0-9a-f]{64}")  # used with fullmatch: `$` admits a trailing newline
 
 
 def derive_audit_key(encryption_key: str | None) -> bytes | None:
@@ -328,7 +328,7 @@ class AuditLog:
                 )
             except (ValueError, KeyError, TypeError, AttributeError):
                 return broken(index, "entry_unreadable", "it is not a well-formed audit entry")
-            if not isinstance(stored, str) or not _HASH_RE.match(stored):
+            if not isinstance(stored, str) or not _HASH_RE.fullmatch(stored):
                 return broken(index, "entry_unreadable", "its hash is not a SHA-256 hex digest")
             if data.get("previous_hash") != previous:
                 return broken(
@@ -489,7 +489,7 @@ class AuditLog:
             for line in self._iter_lines():
                 data = json.loads(line)
                 value = data.get("hash") if isinstance(data, dict) else None
-                if not isinstance(value, str) or not _HASH_RE.match(value):
+                if not isinstance(value, str) or not _HASH_RE.fullmatch(value):
                     corrupt = True
                     break
                 last = value
@@ -547,9 +547,9 @@ class AuditLog:
         # Anchors are only written after an append, so a count below one is forged.
         if not isinstance(entries, int) or isinstance(entries, bool) or entries < 1:
             return None, "has no valid entry count"
-        if not isinstance(head, str) or not _HASH_RE.match(head):
+        if not isinstance(head, str) or not _HASH_RE.fullmatch(head):
             return None, "has no valid head hash"
-        if mac is not None and (not isinstance(mac, str) or not _HASH_RE.match(mac)):
+        if mac is not None and (not isinstance(mac, str) or not _HASH_RE.fullmatch(mac)):
             return None, "has a malformed MAC"
         return _Anchor(entries=entries, head=head, mac=mac), None
 
@@ -575,7 +575,7 @@ def _normalise_head(value: str | None) -> str | None:
     if value is None:
         return None
     head = value.strip().lower()
-    if not _HASH_RE.match(head):
+    if not _HASH_RE.fullmatch(head):
         raise ConfigurationError(
             "an expected audit head must be a 64-character SHA-256 hex digest",
             context={"expected_head": value[:80]},

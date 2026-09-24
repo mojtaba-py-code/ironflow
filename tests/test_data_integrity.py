@@ -890,3 +890,51 @@ class TestIncrementalNeedsAWatermarkAwareSource:
         assert isinstance(result.error, ConfigurationError)
         assert "watermark" in str(result.error)
         assert not target.exists()
+
+
+class TestPipelineValidateSeesItFirst:
+    """Both of these failed only at run time: validate never built the reject
+    destination and never compared the strategy with the source."""
+
+    def test_incremental_on_a_file_source_is_a_validation_problem(self, service, csv_file):
+        spec = PipelineSpec.model_validate(
+            {
+                "name": "p",
+                "tasks": [
+                    {
+                        "name": "t",
+                        "source": {"type": "csv", "path": str(csv_file)},
+                        "destination": {"type": "memory", "buffer": "b"},
+                        "strategy": "incremental",
+                        "incremental": {"column": "id"},
+                    }
+                ],
+            }
+        )
+        report = service.validate(spec)
+        assert not report["valid"]
+        assert any("watermark" in problem for problem in report["problems"])
+
+    def test_an_unsupported_mode_on_the_reject_destination_is_reported(
+        self, service, csv_file, tmp_path
+    ):
+        spec = PipelineSpec.model_validate(
+            {
+                "name": "p",
+                "tasks": [
+                    {
+                        "name": "t",
+                        "source": {"type": "csv", "path": str(csv_file)},
+                        "destination": {"type": "memory", "buffer": "b"},
+                        "reject_destination": {
+                            "type": "json",
+                            "path": str(tmp_path / "rejects.json"),
+                            "mode": "append",
+                        },
+                    }
+                ],
+            }
+        )
+        report = service.validate(spec)
+        assert not report["valid"]
+        assert any("reject destination" in problem for problem in report["problems"])
