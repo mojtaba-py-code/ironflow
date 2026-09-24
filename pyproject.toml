@@ -40,7 +40,7 @@ dependencies = [
 columnar = ["pyarrow>=15", "pandas>=2.2"]
 excel = ["openpyxl>=3.1"]
 remote = ["paramiko>=3.4"]
-api = ["fastapi>=0.111", "uvicorn[standard]>=0.29"]
+api = ["fastapi>=0.111", "uvicorn[standard]>=0.53.0"]
 postgres = ["psycopg[binary]>=3.1"]
 mysql = ["PyMySQL>=1.1"]
 dev = [
