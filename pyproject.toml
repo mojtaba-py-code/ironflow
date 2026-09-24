@@ -34,6 +34,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "psutil>=5.9",
     "defusedxml>=0.7",
+    # Regular expressions written in pipeline files run on this engine rather
+    # than `re`: it has a per-match timeout, which `re` does not. See
+    # ironflow/security/patterns.py.
+    "regex>=2024.11.6",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +54,7 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
     "types-psutil",
+    "types-regex",
 ]
 all = [
     "ironflow[columnar,excel,remote,api,postgres,mysql]",

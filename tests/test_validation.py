@@ -7,6 +7,7 @@ import pytest
 from ironflow.config.models import ValidationRuleSpec, ValidationSpec
 from ironflow.core.errors import ConfigurationError, ValidationError
 from ironflow.core.types import RecordBatch, Severity
+from ironflow.security import patterns
 from ironflow.validation.engine import (
     REJECT_REASON_KEY,
     ValidationEngine,
@@ -131,12 +132,25 @@ class TestFormatRules:
         )
 
     def test_invalid_regex_is_rejected_at_construction(self):
-        with pytest.raises(ConfigurationError, match="invalid validation regex"):
+        with pytest.raises(ConfigurationError, match="invalid regular expression"):
             rule("regex", field="v", pattern="[unclosed")
 
     def test_overlong_regex_is_rejected(self):
         with pytest.raises(ConfigurationError, match="too long"):
             rule("regex", field="v", pattern="a" * 600)
+
+    def test_a_value_the_pattern_cannot_decide_in_time_is_rejected(self, monkeypatch):
+        """A backtracking pattern used to pin a core; now the record fails the rule.
+
+        ``(a+)+$`` against 26 characters took 49 seconds under ``re``, and a
+        length cap was the only guard on a pattern written in a pipeline file.
+        """
+        monkeypatch.setattr(patterns, "MATCH_TIMEOUT_SECONDS", 0.02)
+        rule_obj = rule("regex", field="v", pattern="(e|ee)+$", full_match=False)
+        violations = check(rule_obj, {"v": "e" * 60 + "!"})
+        assert len(violations) == 1
+        assert "time budget" in violations[0].message
+        assert violations[0].severity is Severity.ERROR
 
     def test_email(self):
         assert not check(rule("email", field="v"), {"v": "a@b.com"})

@@ -29,6 +29,10 @@ time, before any evaluation happens.  The design consequences:
   ``"a" * 10**9`` nor ``pow(2, 5_000_000)`` can exhaust memory.  The power bound
   measures the *result*, not the exponent, so ``1.05 ** 240`` - compound interest
   over twenty years - is still an ordinary calculation.
+* **Patterns are configuration, never data.**  ``regex_match`` takes its
+  pattern as a string literal, and matches run on a time-bounded engine
+  (:mod:`ironflow.security.patterns`), so neither the pipeline author nor a
+  field value can hand the evaluator a catastrophically backtracking regex.
 
 Compiled expressions are cached, so evaluating a rule over a million rows parses
 once.
@@ -39,13 +43,13 @@ from __future__ import annotations
 import ast
 import math
 import operator
-import re
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Final
 
 from ironflow.core.errors import ConfigurationError, TransformationError
+from ironflow.security.patterns import compile_untrusted
 
 MAX_EXPRESSION_LENGTH: Final = 2000
 MAX_AST_NODES: Final = 400
@@ -149,12 +153,16 @@ def _to_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+#: Longest pattern ``regex_match`` accepts.
+MAX_REGEX_LENGTH: Final = 200
+
+
 def _regex_match(pattern: str, value: Any) -> bool:
     if value is None:
         return False
-    if len(pattern) > 200:
-        raise TransformationError("regex pattern is too long")
-    return bool(re.search(pattern, str(value)))
+    if not isinstance(pattern, str) or len(pattern) > MAX_REGEX_LENGTH:
+        raise TransformationError("regex pattern must be a string of at most 200 characters")
+    return compile_untrusted(pattern).search(str(value))
 
 
 def _safe_round(value: Any, digits: int = 0) -> Any:
@@ -349,6 +357,8 @@ class SafeExpression:
                     raise ConfigurationError("**kwargs unpacking is not allowed")
                 if any(isinstance(a, ast.Starred) for a in node.args):
                     raise ConfigurationError("*args unpacking is not allowed")
+                if node.func.id == "regex_match":
+                    _check_literal_pattern(node, source)
         return tree
 
     # -- evaluation -------------------------------------------------------- #
@@ -363,17 +373,20 @@ class SafeExpression:
             raise
         except ZeroDivisionError:
             return None  # SQL semantics: division by zero yields NULL, not a crash
-        # OverflowError is in the list because arithmetic can reach it without
-        # tripping the power guard - `(1/3) ** -10_000_000` is a float that grows
-        # rather than an integer that does. Letting it escape would abort the
-        # whole run instead of routing the record to the `on_error` policy.
+        # ArithmeticError rather than a list of its subclasses: arithmetic can
+        # reach OverflowError without tripping the power guard - `(1/3) **
+        # -10_000_000` is a float that grows - and `decimal(amount)` raises
+        # decimal.InvalidOperation on a value like "abc" and decimal.Overflow on
+        # "1E1000000000". None of those derive from ValueError, so each one
+        # escaped this handler and aborted the whole run on a single bad cell
+        # instead of routing that record to the `on_error` policy.
         except (
             TypeError,
             ValueError,
             KeyError,
             IndexError,
             AttributeError,
-            OverflowError,
+            ArithmeticError,
         ) as exc:
             raise TransformationError(
                 "expression evaluation failed",
@@ -539,6 +552,48 @@ def _check_operand_types(op: ast.operator, left: Any, right: Any) -> None:
     )
 
 
+def _check_literal_pattern(node: ast.Call, source: str) -> None:
+    """``regex_match`` must be handed its pattern as a string literal.
+
+    A pattern computed at run time - from a column, say - would let the *data*
+    choose the regular expression, and one crafted value would then decide how
+    much CPU every later record costs.  A literal is fixed by whoever wrote the
+    pipeline, reviewable, and compiled here, so a malformed one fails
+    ``pipeline validate`` rather than the first record of a run.
+    """
+    # Keyword arguments are rejected by the node allow-list, so the pattern can
+    # only ever be the first positional argument.
+    pattern = node.args[0] if node.args else None
+    if not (isinstance(pattern, ast.Constant) and isinstance(pattern.value, str)):
+        raise ConfigurationError(
+            "regex_match() takes its pattern as a string literal",
+            context={"expression": source[:120]},
+        )
+    if len(pattern.value) > MAX_REGEX_LENGTH:
+        raise ConfigurationError(
+            "regex pattern is too long",
+            context={"length": len(pattern.value), "limit": MAX_REGEX_LENGTH},
+        )
+    compile_untrusted(pattern.value)
+
+
+def _log2_magnitude(value: Any) -> float:
+    """``log2(|value|)`` for any numeric type, or 0.0 when ``|value| <= 1``.
+
+    Integers go to :func:`math.log2` directly, which accepts arbitrarily large
+    ones.  Converting through ``float`` first - as this guard once did - raises
+    ``OverflowError`` for anything past about 10**308, and that failure was read
+    as "not huge": ``(10**1000) ** 5000`` sailed through and built a
+    sixteen-million-bit integer.  A ``Decimal`` too large for a float becomes
+    ``inf``, which correctly reads as huge.
+    """
+    if isinstance(value, int):
+        magnitude = abs(value)
+        return math.log2(magnitude) if magnitude > 1 else 0.0
+    real = abs(float(value))
+    return math.log2(real) if real > 1.0 else 0.0
+
+
 def _is_huge_power(base: Any, exponent: Any) -> bool:
     """True when ``base ** exponent`` would build an absurdly large number.
 
@@ -554,16 +609,18 @@ def _is_huge_power(base: Any, exponent: Any) -> bool:
     needs a bound.
     """
     try:
-        magnitude = abs(float(base))
-        power = float(exponent)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    if power <= 0 or magnitude <= 1.0:
+        magnitude_bits = _log2_magnitude(base)
+    except (TypeError, ValueError):
+        return False  # not a number: the operator itself raises TypeError
+    if magnitude_bits <= 0.0:
         return False
     try:
-        return power * math.log2(magnitude) > MAX_POWER_RESULT_BITS
-    except (ValueError, OverflowError):  # pragma: no cover - defensive
-        return True
+        power = float(exponent)
+    except OverflowError:
+        return True  # an exponent past float range, on a base that grows
+    except (TypeError, ValueError):
+        return False
+    return power > 0 and power * magnitude_bits > MAX_POWER_RESULT_BITS
 
 
 # --------------------------------------------------------------------------- #

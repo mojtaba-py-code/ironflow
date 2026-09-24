@@ -28,10 +28,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
 
 from ironflow.config.models import ValidationRuleSpec
-from ironflow.core.errors import ConfigurationError
+from ironflow.core.errors import ConfigurationError, TransformationError
 from ironflow.core.registry import ComponentRegistry
 from ironflow.core.types import FieldType, Record, Severity, Violation
 from ironflow.expressions import compile_expression, record_scope
+from ironflow.security.patterns import compile_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -329,22 +330,23 @@ class RegexRule(Rule):
 
     Options: ``pattern`` (required), ``ignore_case``, ``full_match``.
 
-    The pattern is compiled once at construction; a length cap keeps a
-    catastrophically backtracking pattern from being introduced accidentally.
+    The pattern is compiled once, at construction, on the time-bounded engine
+    in :mod:`ironflow.security.patterns`.  A length cap alone never stopped a
+    catastrophically backtracking pattern - ``(a|aa)+$`` is eight characters -
+    so each match also carries a timeout, and a value the pattern cannot decide
+    in time is rejected rather than waited on.
     """
 
     def __init__(self, spec: ValidationRuleSpec) -> None:
         super().__init__(spec)
         pattern = str(self.option("pattern", required=True))
-        if len(pattern) > 500:
-            raise ConfigurationError("validation regex is too long", context={"rule": self.name})
-        flags = re.IGNORECASE if self.option("ignore_case", False) else 0
         try:
-            self._regex = re.compile(pattern, flags)
-        except re.error as exc:
-            raise ConfigurationError(
-                "invalid validation regex", context={"pattern": pattern[:80]}, cause=exc
-            ) from exc
+            self._regex = compile_untrusted(
+                pattern, ignore_case=bool(self.option("ignore_case", False))
+            )
+        except ConfigurationError as exc:
+            exc.with_context(rule=self.name)
+            raise
         self._full = bool(self.option("full_match", True))
 
     def check(self, record: Record, index: int) -> list[Violation]:
@@ -353,7 +355,15 @@ class RegexRule(Rule):
         if value is None:
             return []
         text = str(value)
-        matched = self._regex.fullmatch(text) if self._full else self._regex.search(text)
+        try:
+            matched = self._regex.fullmatch(text) if self._full else self._regex.search(text)
+        except TransformationError:
+            return [
+                self.violation(
+                    f"'{field}' could not be checked: the pattern exceeded its time budget",
+                    index,
+                )
+            ]
         if matched:
             return []
         return [self.violation(f"'{field}' does not match the required pattern", index)]

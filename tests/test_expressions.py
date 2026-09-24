@@ -7,6 +7,8 @@ has an arbitrary-code-execution vulnerability reachable from a pipeline file.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from ironflow.core.errors import ConfigurationError, TransformationError
@@ -18,6 +20,7 @@ from ironflow.expressions import (
     evaluate_condition,
     record_scope,
 )
+from ironflow.security import patterns
 
 
 class TestSandboxEscapes:
@@ -140,6 +143,39 @@ class TestResourceLimits:
         with pytest.raises(TransformationError, match="evaluation failed"):
             evaluate("(1/3) ** -10000000", {})
 
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "(10 ** 1000) ** 50",
+            "pow(10 ** 1000, 30)",
+            "(10 ** 1000) ** (10 ** 1000)",
+            "2 ** (10 ** 400)",
+        ],
+    )
+    def test_a_base_or_exponent_past_float_range_is_still_sized(self, expression):
+        """The guard used to size a power through ``float(base)``.
+
+        That conversion overflows past about 10**308, and the overflow was read
+        as "not huge": ``(10**1000) ** 5000`` built a sixteen-million-bit
+        integer, and with the exponent left unbounded a single expression could
+        pin a worker indefinitely.
+        """
+        with pytest.raises(TransformationError, match="size limit"):
+            evaluate(expression, {})
+
+    def test_a_large_base_with_a_small_exponent_is_still_allowed(self):
+        assert evaluate("(10 ** 10) ** 100", {}) == 10**1000
+
+    @pytest.mark.parametrize("value", ["abc", "1E1000000000"])
+    def test_decimal_errors_follow_the_error_policy_instead_of_aborting(self, value):
+        """``decimal.InvalidOperation`` and ``decimal.Overflow`` are not ValueErrors.
+
+        Both escaped ``evaluate`` untranslated, so one malformed cell in a
+        third-party file aborted the whole run instead of reaching ``on_error``.
+        """
+        with pytest.raises(TransformationError, match="evaluation failed"):
+            evaluate("decimal(amount) + 1", {"amount": value})
+
 
 class TestEvaluation:
     @pytest.mark.parametrize(
@@ -250,8 +286,53 @@ class TestFunctions:
             compile_expression("max(**values)")
 
     def test_regex_pattern_length_is_capped(self):
-        with pytest.raises(TransformationError, match="too long"):
-            evaluate(f"regex_match('{'a' * 250}', 'x')", {})
+        with pytest.raises(ConfigurationError, match="too long"):
+            compile_expression(f"regex_match('{'a' * 250}', 'x')")
+
+    def test_regex_match_works(self):
+        assert evaluate("regex_match('^[A-Z]{2}[0-9]+$', code)", {"code": "NL42"}) is True
+        assert evaluate("regex_match('x', code)", {"code": "abc"}) is False
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "regex_match(pattern, value)",
+            "regex_match(row['pattern'], value)",
+            "regex_match(concat('a', suffix), value)",
+            "regex_match()",
+        ],
+    )
+    def test_the_regex_pattern_must_be_a_literal(self, expression):
+        """A pattern read from a column would let the data choose the regex."""
+        with pytest.raises(ConfigurationError, match="string literal"):
+            compile_expression(expression)
+
+    def test_an_invalid_regex_fails_when_compiled_not_on_the_first_record(self):
+        with pytest.raises(ConfigurationError, match="invalid regular expression"):
+            compile_expression("regex_match('[unclosed', value)")
+
+    def test_catastrophic_backtracking_is_cut_off(self, monkeypatch):
+        """``(a|aa)+$`` is eight characters and backtracks exponentially.
+
+        Under ``re`` a 26-character value took 45 seconds, and a length cap was
+        the only guard.
+        """
+        monkeypatch.setattr(patterns, "MATCH_TIMEOUT_SECONDS", 0.05)
+        expression = compile_expression("regex_match('(c|cc)+$', value)")
+        started = time.perf_counter()
+        with pytest.raises(TransformationError, match="time budget"):
+            expression.evaluate({"value": "c" * 60 + "!"})
+        assert time.perf_counter() - started < 5
+
+    def test_a_pattern_that_keeps_timing_out_is_disabled(self, monkeypatch):
+        """A timeout alone still costs ``rows x timeout`` over a large load."""
+        monkeypatch.setattr(patterns, "MATCH_TIMEOUT_SECONDS", 0.02)
+        expression = compile_expression("regex_match('(d|dd)+$', value)")
+        for _ in range(patterns.MAX_TIMEOUTS):
+            with pytest.raises(TransformationError, match="time budget"):
+                expression.evaluate({"value": "d" * 60 + "!"})
+        with pytest.raises(TransformationError, match="disabled"):
+            expression.evaluate({"value": "dd"})
 
 
 class TestCompilation:
