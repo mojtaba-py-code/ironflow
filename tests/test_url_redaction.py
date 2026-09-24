@@ -61,6 +61,20 @@ class TestUserinfoPassword:
         """``***`` for an unset password would send an operator down the wrong path."""
         assert redact_url("postgresql://etl:@db/prod") == "postgresql://etl:@db/prod"
 
+    def test_a_token_in_the_users_place_is_masked(self):
+        """``https://<token>@github.com`` is how git and many APIs take a token.
+
+        A user name with no password cannot be told apart from such a token, so
+        it is masked whole - more than strictly necessary, never less.
+        """
+        token = "_".join(("ghp", "A1b2" * 9))
+        redacted = redact_url(f"cloning https://{token}@github.com/org/repo.git failed")
+        assert token not in redacted
+        assert redacted == "cloning https://***@github.com/org/repo.git failed"
+        assert (
+            redact_url("postgresql://etl@db.internal/prod") == "postgresql://***@db.internal/prod"
+        )
+
     @pytest.mark.parametrize(
         "url",
         [
@@ -68,9 +82,9 @@ class TestUserinfoPassword:
             "sqlite:////var/lib/ironflow/state.db",
             "sqlite:///:memory:",
             "https://api.example.com:8443/v1/items?page=2&sort=asc",
-            "postgresql://etl@db.internal/prod?sslmode=require",
             "file:///srv/data/a:b@c.csv",
             "http://[::1]:8080/health",
+            "https://api.example.com/users/me@example.com/profile",
         ],
     )
     def test_urls_without_credentials_are_unchanged(self, url):

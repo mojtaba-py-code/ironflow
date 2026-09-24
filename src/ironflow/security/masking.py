@@ -203,7 +203,9 @@ def redact_url(url: str) -> str:
     The userinfo password and the values of credential-like query parameters
     (``password``, ``token``, ``api_key``, ``sslpassword``, ``sig`` ...) become
     ``***``; the scheme, user, host, port, database and every other parameter
-    stay readable, because they are what an operator needs to see.
+    stay readable, because they are what an operator needs to see.  A user name
+    with no password after it is the exception, masked whole: that shape is
+    usually a token standing in for the user.
 
     The userinfo is deliberately not handed to ``urlsplit`` or SQLAlchemy's
     ``make_url``. Real DSNs carry unencoded passwords, and both parsers split
@@ -230,6 +232,11 @@ def _redact_url_token(token: str) -> str:
     # it is a path, a query, or an IPv6 literal - so there is no password.
     if colon != -1 and not any(char in rest[:colon] for char in "/?#["):
         spans.append((colon + 1, at))
+    elif at > 0 and colon == -1 and not any(char in rest[:at] for char in "/?#["):
+        # A user name with no password is often a token in the user's place -
+        # `https://<token>@github.com/...` is how git and many APIs take one -
+        # so it is masked whole, as pip masks it.
+        spans.append((0, at))
 
     for match in _URL_PARAM_RE.finditer(rest):
         name = unquote(match.group("name"))
