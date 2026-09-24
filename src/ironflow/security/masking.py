@@ -26,6 +26,7 @@ import hmac
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
+from urllib.parse import unquote
 
 from ironflow.core.errors import ConfigurationError
 
@@ -67,6 +68,9 @@ SENSITIVE_KEY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"iban",
         r"dsn",
         r"connection[_-]?string",
+        # Deliberately not "database_url": that would blank state_database_url
+        # in `config show`, hiding the host and database an operator runs it
+        # to check. redact_url masks only the credentials inside the URL.
     )
 )
 
@@ -74,7 +78,18 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 _CARD_RE = re.compile(r"^(?:\d[ -]?){13,19}$")
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _PHONE_RE = re.compile(r"^\+?\d[\d\s().-]{7,}\d$")
-_URL_CREDENTIALS_RE = re.compile(r"(?P<scheme>[a-zA-Z][\w+.-]*://)(?P<user>[^/@\s:]+):[^/@\s]*@")
+
+#: A URL inside arbitrary text - a bare DSN, a log line, an error message. The
+#: token runs to the next whitespace rather than to the next "/" or "@",
+#: because the credential being hunted may contain either.
+_URL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S*")
+#: The ``name=`` of a parameter. Only the name is consumed, so ``;user=u;
+#: password=p`` still yields the second parameter after the first.
+_URL_PARAM_RE = re.compile(r"(?<=[?&;])(?P<name>[^=&;#?/\s]+)=")
+#: Credential parameters whose names :func:`is_sensitive_key` does not cover:
+#: ODBC's ``pwd`` and the ``sig`` of an Azure SAS URL, which is a bearer token.
+_SENSITIVE_URL_PARAMS = frozenset({"pwd", "sig"})
+_URL_MASK = "***"
 
 
 def is_sensitive_key(key: str) -> bool:
@@ -182,8 +197,70 @@ def hash_value(value: Any, *, key: str | bytes | None = None, algorithm: str = "
 
 
 def redact_url(url: str) -> str:
-    """Strip the password from a URL while keeping it diagnosable."""
-    return _URL_CREDENTIALS_RE.sub(r"\g<scheme>\g<user>:***@", url)
+    """Mask the credentials in every URL inside ``url``, keeping it diagnosable.
+
+    ``url`` may be a bare URL or any text containing URLs, such as a log line.
+    The userinfo password and the values of credential-like query parameters
+    (``password``, ``token``, ``api_key``, ``sslpassword``, ``sig`` ...) become
+    ``***``; the scheme, user, host, port, database and every other parameter
+    stay readable, because they are what an operator needs to see.
+
+    The userinfo is deliberately not handed to ``urlsplit`` or SQLAlchemy's
+    ``make_url``. Real DSNs carry unencoded passwords, and both parsers split
+    those at the wrong character: ``urlsplit`` ends the authority at the first
+    ``/``, so the tail of a base64 password lands in the path; ``make_url`` ends
+    the password at its first ``@``. Either way the rest of the password is
+    printed as if it were the host. The password is therefore taken as
+    everything between the first ``:`` of the userinfo and the *last* ``@``.
+    Where the text is ambiguous - an ``@`` after the host, say - that masks
+    more than strictly necessary, never less; a leaked password is the worse
+    failure. Plain string operations cannot raise, so malformed input (a broken
+    IPv6 literal, stray brackets) is masked rather than crashing the log call.
+    """
+    return _URL_TOKEN_RE.sub(lambda match: _redact_url_token(match.group(0)), url)
+
+
+def _redact_url_token(token: str) -> str:
+    scheme, separator, rest = token.partition("://")
+    spans: list[tuple[int, int]] = []
+
+    at = rest.rfind("@")
+    colon = rest.find(":", 0, at) if at != -1 else -1
+    # A "/", "?", "#" or "[" before that colon means it is not in a userinfo -
+    # it is a path, a query, or an IPv6 literal - so there is no password.
+    if colon != -1 and not any(char in rest[:colon] for char in "/?#["):
+        spans.append((colon + 1, at))
+
+    for match in _URL_PARAM_RE.finditer(rest):
+        name = unquote(match.group("name"))
+        if is_sensitive_key(name) or name.lower() in _SENSITIVE_URL_PARAMS:
+            # The value runs to the next "&", not to ";" or "#": a password may
+            # contain either, and masking a fragment by mistake costs nothing.
+            end = rest.find("&", match.end())
+            spans.append((match.end(), len(rest) if end == -1 else end))
+
+    return f"{scheme}{separator}{_mask_spans(rest, spans)}"
+
+
+def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Replace each span with ``***``, merging overlaps into one mask.
+
+    Empty spans are left alone: showing ``***`` for a password that is not set
+    would send an operator chasing the wrong problem.
+    """
+    merged: list[list[int]] = []
+    for start, end in sorted(span for span in spans if span[1] > span[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.extend((text[cursor:start], _URL_MASK))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def is_redactable(value: Any) -> bool:
