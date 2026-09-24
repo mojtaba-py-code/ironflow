@@ -16,7 +16,7 @@
 # --------------------------------------------------------------------------- #
 # The base is pinned by digest in both stages: a tag is a moving pointer, and
 # Dependabot proposes every refresh as a reviewable change instead.
-FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS builder
+FROM python:3.14-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56 AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -37,7 +37,7 @@ RUN python -m pip install --upgrade pip \
 # --------------------------------------------------------------------------- #
 # Runtime
 # --------------------------------------------------------------------------- #
-FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS runtime
+FROM python:3.14-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56 AS runtime
 
 LABEL org.opencontainers.image.title="IronFlow" \
       org.opencontainers.image.description="Enterprise ETL Data Pipeline" \
@@ -54,11 +54,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 # libpq5 for psycopg, and nothing else: no compilers, and no curl - the
 # healthcheck uses the interpreter that is already here. `upgrade` applies the
-# Debian security fixes published since the pinned base image was built.
+# Debian security fixes published since the pinned base image was built. pip
+# is removed: it is how packages get *into* an image, nothing at runtime uses
+# it, and it carries advisories of its own.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends libpq5 \
  && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall --yes pip \
  && groupadd --system --gid 1001 ironflow \
  && useradd --system --uid 1001 --gid ironflow --create-home --home-dir /home/ironflow ironflow
 
