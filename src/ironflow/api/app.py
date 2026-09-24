@@ -9,9 +9,17 @@ Security posture
   unauthenticated in a production environment.
 * **Authorisation** is per-endpoint: reading history needs ``run:read``,
   triggering a run needs ``pipeline:run``, and pipeline-name scoping is applied
-  on top.
-* **CORS** defaults to no origins.  A wildcard on a service that can trigger
-  data movement would let any page a logged-in operator visits start a job.
+  on top - to *every* read, including the ones that do not name a pipeline.
+  The run list, a run looked up by id, the statistics and the dashboard all
+  used to answer a principal scoped to ``sales_*`` with ``hr_*`` data; they now
+  filter through :meth:`PipelineService.visible_pipelines`, and a run outside
+  the caller's scope is a 404, not a 403 that would confirm the id exists.
+* **The dashboard** is a route like any other: with authentication on it
+  needs a token.  It used to render every pipeline and the run timeline to
+  anyone who asked.
+* **CORS** defaults to no origins, and never runs in credentials mode: the API
+  authenticates with a bearer header, which no cross-origin page can attach
+  on the operator's behalf, so there is nothing for credentials mode to carry.
 * **Run triggering is asynchronous** via a background task, and the response
   returns the execution id.  A synchronous multi-hour ETL run over HTTP would
   hit every proxy timeout in the path.
@@ -93,7 +101,10 @@ def create_app(settings: Settings | None = None, service: PipelineService | None
         api.add_middleware(
             CORSMiddleware,
             allow_origins=list(resolved.api_cors_origins),
-            allow_credentials=True,
+            # With credentials on, Starlette reflects any origin a "*" list
+            # admits - a wildcard plus credentials is the configuration every
+            # CORS guide warns against.  Bearer tokens do not need it.
+            allow_credentials=False,
             allow_methods=["GET", "POST"],
             allow_headers=["Authorization", "Content-Type"],
         )
@@ -157,6 +168,15 @@ def _require(principal: Principal, permission: Permission, pipeline: str | None 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc.message)) from exc
 
 
+def _require_unscoped(principal: Principal, what: str) -> None:
+    """For data that spans every pipeline and cannot be filtered per scope."""
+    if "*" not in principal.pipeline_scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"{what} covers every pipeline; it needs a principal without a pipeline scope",
+        )
+
+
 # --------------------------------------------------------------------------- #
 def _register_routes(api: FastAPI) -> None:
     @api.get("/health", response_model=HealthResponse, tags=["system"])
@@ -183,6 +203,9 @@ def _register_routes(api: FastAPI) -> None:
         """Prometheus exposition endpoint."""
         if settings.auth_enabled:
             _require(principal, Permission.METRICS_READ)
+            # Every series carries a pipeline label, so a scoped principal would
+            # read other teams' volumes and failure counts here.
+            _require_unscoped(principal, "the metrics endpoint")
         return METRICS.render_prometheus()
 
     @api.get("/api/pipelines", tags=["pipelines"])
@@ -286,7 +309,10 @@ def _register_routes(api: FastAPI) -> None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="unknown status"
             ) from exc
-        return service.history(pipeline_name=pipeline, status=parsed, limit=limit)
+        visible = None if pipeline else service.visible_pipelines(principal)
+        return service.history(
+            pipeline_name=pipeline, status=parsed, limit=limit, pipelines=visible
+        )
 
     @api.get("/api/runs/{execution_id}", tags=["runs"])
     async def get_run(
@@ -296,7 +322,8 @@ def _register_routes(api: FastAPI) -> None:
     ) -> dict[str, Any]:
         _require(principal, Permission.RUN_HISTORY_READ)
         run = service.run_details(execution_id)
-        if run is None:
+        # Out of scope reads as absent: a 403 would confirm the id exists.
+        if run is None or not principal.can_access_pipeline(str(run.get("pipeline", ""))):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
         return run
 
@@ -308,18 +335,32 @@ def _register_routes(api: FastAPI) -> None:
         days: Annotated[int, Query(ge=1, le=365)] = 30,
     ) -> dict[str, Any]:
         _require(principal, Permission.METRICS_READ, pipeline)
-        return service.statistics(pipeline, days=days)
+        visible = None if pipeline else service.visible_pipelines(principal)
+        return service.statistics(pipeline, days=days, pipelines=visible)
 
     @api.get("/", response_class=HTMLResponse, tags=["system"], include_in_schema=False)
-    async def dashboard(service: Annotated[PipelineService, Depends(get_service)]) -> str:
+    async def dashboard(
+        service: Annotated[PipelineService, Depends(get_service)],
+        principal: Annotated[Principal, Depends(get_principal)],
+    ) -> str:
+        """Server-rendered overview.  With auth on, it needs a token like the API.
+
+        A browser does not send a bearer header by itself, so in an
+        authenticated deployment the dashboard is reached through a proxy that
+        adds one (an SSO gateway) - not by leaving the page open.
+        """
         from ironflow.api.dashboard import render_dashboard
 
+        _require(principal, Permission.PIPELINE_READ)
+        _require(principal, Permission.RUN_HISTORY_READ)
+        visible = service.visible_pipelines(principal)
         return render_dashboard(
-            statistics=service.statistics(),
-            timeline=service.runs.timeline(limit=25),
+            statistics=service.statistics(pipelines=visible),
+            timeline=service.runs.timeline(limit=25, pipelines=visible),
             pipelines=[
                 {"name": s.name, "version": s.version, "tasks": len(s.tasks), "owner": s.owner}
                 for s in service.list_pipelines()
+                if principal.can_access_pipeline(s.name)
             ],
         )
 

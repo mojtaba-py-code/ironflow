@@ -14,6 +14,7 @@ constructs its own dependencies, which is what keeps the lower layers testable.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -304,11 +305,30 @@ class PipelineService:
         status: RunStatus | None = None,
         limit: int = 20,
         principal: Principal | None = None,
+        pipelines: Collection[str] | None = None,
     ) -> list[dict[str, Any]]:
         self.access.authorize(
             principal or Principal.system(), Permission.RUN_HISTORY_READ, pipeline=pipeline_name
         )
-        return self.runs.list_runs(pipeline_name=pipeline_name, status=status, limit=limit)
+        return self.runs.list_runs(
+            pipeline_name=pipeline_name, status=status, limit=limit, pipelines=pipelines
+        )
+
+    def visible_pipelines(self, principal: Principal) -> list[str] | None:
+        """The pipeline names ``principal`` may see; ``None`` when it may see all.
+
+        Scopes are glob patterns, so they cannot become a SQL filter directly:
+        the candidates are every name with run history plus every current
+        definition, filtered through the principal's own patterns.  Any read
+        that is not about one named pipeline must pass through this - the
+        run list, the statistics and the dashboard each once returned every
+        pipeline's data to a principal scoped to ``sales_*``.
+        """
+        if "*" in principal.pipeline_scopes:
+            return None
+        candidates = set(self.runs.pipeline_names())
+        candidates.update(spec.name for spec in self.list_pipelines())
+        return sorted(name for name in candidates if principal.can_access_pipeline(name))
 
     def run_details(self, execution_id: str) -> dict[str, Any] | None:
         return self.runs.get_run(execution_id)
@@ -324,8 +344,14 @@ class PipelineService:
             "watermarks": self.watermarks.list(pipeline_name),
         }
 
-    def statistics(self, pipeline_name: str | None = None, *, days: int = 30) -> dict[str, Any]:
-        return self.runs.statistics(pipeline_name, days=days)
+    def statistics(
+        self,
+        pipeline_name: str | None = None,
+        *,
+        days: int = 30,
+        pipelines: Collection[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.runs.statistics(pipeline_name, days=days, pipelines=pipelines)
 
     # -- maintenance ------------------------------------------------------- #
     def clean(

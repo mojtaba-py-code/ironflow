@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import timedelta
 from typing import Any, cast
 
@@ -200,11 +200,15 @@ class RunRepository(BaseRepository):
         status: RunStatus | None = None,
         limit: int = 50,
         offset: int = 0,
+        pipelines: Collection[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """Newest first.  ``pipelines`` restricts to those names; ``None`` means all."""
         with self.db.session() as session:
             statement = select(PipelineRun).order_by(PipelineRun.started_at.desc())
             if pipeline_name:
                 statement = statement.where(PipelineRun.pipeline_name == pipeline_name)
+            if pipelines is not None:
+                statement = statement.where(PipelineRun.pipeline_name.in_(list(pipelines)))
             if status:
                 statement = statement.where(PipelineRun.status == status.value)
             statement = statement.limit(min(limit, 500)).offset(max(0, offset))
@@ -242,13 +246,21 @@ class RunRepository(BaseRepository):
                 or 0
             )
 
-    def statistics(self, pipeline_name: str | None = None, *, days: int = 30) -> dict[str, Any]:
+    def statistics(
+        self,
+        pipeline_name: str | None = None,
+        *,
+        days: int = 30,
+        pipelines: Collection[str] | None = None,
+    ) -> dict[str, Any]:
         """Aggregate KPIs for the dashboard and ``ironflow report``."""
         since = utcnow() - timedelta(days=max(1, days))
         with self.db.session() as session:
             base = select(PipelineRun).where(PipelineRun.started_at >= since)
             if pipeline_name:
                 base = base.where(PipelineRun.pipeline_name == pipeline_name)
+            if pipelines is not None:
+                base = base.where(PipelineRun.pipeline_name.in_(list(pipelines)))
             runs = list(session.scalars(base))
 
         total = len(runs)
@@ -279,12 +291,15 @@ class RunRepository(BaseRepository):
             "max_duration_seconds": round(durations[-1], 3) if durations else 0.0,
         }
 
-    def timeline(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        """Recent runs across all pipelines, for the execution-timeline chart."""
+    def timeline(
+        self, *, limit: int = 100, pipelines: Collection[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Recent runs across pipelines, for the execution-timeline chart."""
         with self.db.session() as session:
-            statement = (
-                select(PipelineRun).order_by(PipelineRun.started_at.desc()).limit(min(limit, 500))
-            )
+            statement = select(PipelineRun).order_by(PipelineRun.started_at.desc())
+            if pipelines is not None:
+                statement = statement.where(PipelineRun.pipeline_name.in_(list(pipelines)))
+            statement = statement.limit(min(limit, 500))
             return [
                 {
                     "pipeline": run.pipeline_name,
@@ -296,6 +311,11 @@ class RunRepository(BaseRepository):
                 }
                 for run in session.scalars(statement)
             ]
+
+    def pipeline_names(self) -> list[str]:
+        """Every pipeline name that has run history."""
+        with self.db.session() as session:
+            return sorted(session.scalars(select(PipelineRun.pipeline_name).distinct()))
 
     def purge(self, *, older_than_days: int = 90) -> int:
         """Delete history older than the retention window; returns rows removed."""
