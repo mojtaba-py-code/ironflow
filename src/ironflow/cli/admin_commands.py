@@ -368,20 +368,40 @@ def state_watermarks(
 def state_audit(
     ctx: typer.Context,
     limit: Annotated[int, typer.Option("--limit", "-n", min=1, max=1000)] = 25,
-    verify: Annotated[bool, typer.Option("--verify", help="Verify the audit hash chain.")] = False,
+    verify: Annotated[
+        bool, typer.Option("--verify", help="Verify the hash chain and its head anchor.")
+    ] = False,
+    expect_head: Annotated[
+        str | None,
+        typer.Option(
+            "--expect-head",
+            help="A head hash recorded earlier, off-host, that the log must still contain. "
+            "Implies --verify.",
+        ),
+    ] = None,
 ) -> None:
     """Read the audit trail and optionally verify its integrity."""
     cli = get_cli(ctx)
     audit = cli.service.audit
 
-    if verify:
-        intact, broken_at = audit.verify_chain()
-        if intact:
-            cli.info("[green]audit chain intact[/green]")
+    if verify or expect_head is not None:
+        try:
+            result = audit.verify(expect_head=expect_head)
+        except IronFlowError as exc:
+            cli.fail(exc, code=EXIT_INVALID_CONFIG)
+            return
+        if result.intact:
+            # The head is printed in full so it can be recorded off-host and
+            # checked later with --expect-head.
+            count = f"{result.entries} {'entry' if result.entries == 1 else 'entries'}"
+            chain = "HMAC-SHA256" if result.keyed else "SHA-256, unkeyed"
+            cli.info(f"[green]audit chain intact[/green] ({count}, {chain})")
+            cli.info(f"head: {result.head}")
         else:
-            cli.info(f"[bold red]audit chain broken at entry {broken_at}[/bold red]")
-        cli.emit({"intact": intact, "broken_at": broken_at})
-        if not intact:
+            where = f" at entry {result.broken_at}" if result.broken_at is not None else ""
+            cli.info(f"[bold red]audit chain broken{where}:[/bold red] {plain_text(result.detail)}")
+        cli.emit(result.to_dict())
+        if not result.intact:
             raise typer.Exit(EXIT_INVALID_CONFIG)
         return
 

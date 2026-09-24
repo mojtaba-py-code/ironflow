@@ -25,7 +25,7 @@ from ironflow.connectors.factory import ConnectorFactory
 from ironflow.core.errors import ConfigurationError, IronFlowError
 from ironflow.core.events import EventBus
 from ironflow.core.types import RunStatus
-from ironflow.observability.audit import AuditLog
+from ironflow.observability.audit import AuditLog, derive_audit_key
 from ironflow.observability.metrics import METRICS, MetricsRegistry
 from ironflow.orchestration.dag import TaskGraph
 from ironflow.orchestration.scheduler import Scheduler
@@ -68,7 +68,13 @@ class PipelineService:
         self.checkpoints = CheckpointRepository(self.db)
         self.schemas = SchemaRepository(self.db)
 
-        self.audit = AuditLog(self.settings.audit_file, enabled=self.settings.audit_enabled)
+        # Keyed whenever an encryption key is configured, so that editing the
+        # audit file and re-deriving its hashes needs the platform's key.
+        self.audit = AuditLog(
+            self.settings.audit_file,
+            enabled=self.settings.audit_enabled,
+            key=derive_audit_key(self.settings.encryption_key),
+        )
         self.access = AccessControl(enabled=self.settings.auth_enabled)
         self.factory = ConnectorFactory(self.settings)
         self.repository = PipelineRepository(
