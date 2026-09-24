@@ -27,6 +27,7 @@ from ironflow.pipeline.results import PipelineResult
 from ironflow.services.reporting import (
     build_run_report,
     default_report_path,
+    plain_text,
     render_console_summary,
     write_html,
     write_json,
@@ -83,20 +84,21 @@ def list_pipelines(ctx: typer.Context) -> None:
         for spec in specs
     ]
 
-    table = Table(title=f"Pipelines in {cli.service.repository.directory}", expand=True)
+    table = Table(title=f"Pipelines in {plain_text(cli.service.repository.directory)}", expand=True)
     table.add_column("Name", style="bold")
     table.add_column("Ver", justify="right")
     table.add_column("Tasks", justify="right")
     table.add_column("Schedule")
     table.add_column("Owner")
     table.add_column("Enabled", justify="center")
+    # Every cell below comes from a pipeline file: text, never markup.
     for item in payload:
         table.add_row(
-            str(item["name"]),
-            str(item["version"]),
+            plain_text(item["name"]),
+            plain_text(item["version"]),
             str(item["tasks"]),
-            str(item["schedule"] or "-"),
-            str(item["owner"] or "-"),
+            plain_text(item["schedule"] or "-"),
+            plain_text(item["owner"] or "-"),
             "[green]yes[/green]" if item["enabled"] else "[red]no[/red]",
         )
     if not payload:
@@ -158,7 +160,7 @@ def show_pipeline(
         "tasks": tasks,
     }
 
-    table = Table(title=f"{spec.name} v{spec.version}", expand=True)
+    table = Table(title=f"{plain_text(spec.name)} v{plain_text(spec.version)}", expand=True)
     table.add_column("Task", style="bold")
     table.add_column("Depends on")
     table.add_column("Source")
@@ -168,16 +170,16 @@ def show_pipeline(
     table.add_column("Rules", justify="right")
     for task in tasks:
         table.add_row(
-            str(task["name"]),
-            ", ".join(task["depends_on"]) or "-",
-            str(task["source"] or "-"),
-            str(task["destination"] or "-"),
-            str(task["strategy"]),
+            plain_text(task["name"]),
+            plain_text(", ".join(task["depends_on"]) or "-"),
+            plain_text(task["source"] or "-"),
+            plain_text(task["destination"] or "-"),
+            plain_text(task["strategy"]),
             str(len(task["transformations"])),
             str(task["validation_rules"]),
         )
     cli.info(
-        f"[dim]levels: {graph.levels}  depth: {graph.depth}  "
+        f"[dim]levels: {plain_text(graph.levels)}  depth: {graph.depth}  "
         f"max parallelism: {graph.max_width}[/dim]"
     )
     cli.emit(payload, table)
@@ -209,11 +211,13 @@ def validate_pipeline(
 
     for report in reports:
         marker = "[green]VALID[/green]" if report["valid"] else "[red]INVALID[/red]"
-        cli.info(f"{marker}  {report['pipeline']}")
+        cli.info(f"{marker}  {plain_text(report['pipeline'])}")
+        # Problems and warnings quote the pipeline file (connector types, rule
+        # options), so one crafted value must not take down `validate --all`.
         for problem in report["problems"]:
-            cli.info(f"  [red]![/red] {problem}")
+            cli.info(f"  [red]![/red] {plain_text(problem)}")
         for warning in report["warnings"]:
-            cli.info(f"  [yellow]?[/yellow] {warning}")
+            cli.info(f"  [yellow]?[/yellow] {plain_text(warning)}")
 
     if cli.json_output:
         cli.emit(payload)
@@ -293,7 +297,7 @@ def _write_report(cli: CliContext, result: PipelineResult, target: Path) -> None
     if path.is_dir() or not path.suffix:
         path = default_report_path(path, result.pipeline_name, result.execution_id, "html")
     written = write_json(payload, path) if path.suffix == ".json" else write_html(payload, path)
-    cli.info(f"[dim]report written to {written}[/dim]")
+    cli.info(f"[dim]report written to {plain_text(written)}[/dim]")
 
 
 @app.command("retry")
@@ -347,11 +351,11 @@ def pipeline_status(
     stats = payload["statistics"]
     last = payload["last_run"]
 
-    table = Table(title=f"Status: {name}", expand=True, show_header=False)
+    table = Table(title=f"Status: {plain_text(name)}", expand=True, show_header=False)
     table.add_column("Metric", style="bold")
     table.add_column("Value")
-    table.add_row("Last status", str(last["status"]) if last else "never run")
-    table.add_row("Last run", str(last["started_at"]) if last else "-")
+    table.add_row("Last status", plain_text(last["status"]) if last else "never run")
+    table.add_row("Last run", plain_text(last["started_at"]) if last else "-")
     table.add_row("Currently running", str(payload["running"]))
     table.add_row("Runs (30d)", str(stats["runs_total"]))
     table.add_row("Success rate", f"{stats['success_rate'] * 100:.1f}%")
@@ -397,14 +401,14 @@ def pipeline_history(
     for run in runs:
         colour = colours.get(str(run["status"]), "white")
         table.add_row(
-            str(run["started_at"] or "-")[:19],
-            str(run["pipeline"]),
-            f"[{colour}]{run['status']}[/{colour}]",
+            plain_text(str(run["started_at"] or "-")[:19]),
+            plain_text(run["pipeline"]),
+            f"[{colour}]{plain_text(run['status'])}[/{colour}]",
             f"{run['duration_seconds']:.2f}",
             str(run["rows_read"]),
             str(run["rows_written"]),
             str(run["rows_rejected"]),
-            str(run["execution_id"])[:16],
+            plain_text(str(run["execution_id"])[:16]),
         )
     if not runs:
         cli.info("[yellow]No runs recorded yet.[/yellow]")
@@ -423,7 +427,7 @@ def pipeline_logs(
         cli.fail(f"no run found with execution id {execution_id!r}", code=EXIT_INVALID_CONFIG)
         return
 
-    table = Table(title=f"{run['pipeline']} · {execution_id}", expand=True)
+    table = Table(title=f"{plain_text(run['pipeline'])} · {plain_text(execution_id)}", expand=True)
     table.add_column("Task", style="bold")
     table.add_column("Status")
     table.add_column("Attempt", justify="right")
@@ -436,14 +440,15 @@ def pipeline_logs(
     for task in run.get("task_runs", []):
         error = task.get("error") or {}
         table.add_row(
-            str(task["task"]),
-            str(task["status"]),
+            plain_text(task["task"]),
+            plain_text(task["status"]),
             str(task["attempt"]),
             f"{task['duration_seconds']:.2f}",
             str(task["rows_read"]),
             str(task["rows_written"]),
             str(task["rows_rejected"]),
-            str(error.get("message", ""))[:60],
+            # Error messages quote source data; truncate first, then escape.
+            plain_text(str(error.get("message", ""))[:60]),
         )
     cli.emit(run, table)
 

@@ -15,6 +15,12 @@ The HTML writer escapes every interpolated value with :func:`html.escape`.  Run
 data contains error messages that contain source data, so a report is an XSS
 sink unless every value is escaped - including the ones that "obviously" come
 from our own enums.
+
+The terminal is a sink too.  Rich reads ``[...]`` in any string as markup and
+passes escape sequences straight through, so a pipeline file or a source row
+could restyle the output, plant an OSC-8 hyperlink, or crash a whole listing
+with an unbalanced ``[/x]``.  Every such value goes through :func:`plain_text`
+before it reaches a console.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from rich.markup import escape as escape_markup
 
 from ironflow.core.context import utcnow
 from ironflow.core.types import RunStatus
@@ -42,6 +50,26 @@ _STATUS_COLOURS = {
     "cancelled": "#8250df",
     "running": "#0969da",
 }
+
+#: C0 and C1 control characters and DEL, each mapped to the escape Python itself
+#: prints for it. None of them is text: ESC opens an ANSI sequence, CR and BS
+#: overwrite what is already on the line, and a newline in a value could forge
+#: a line of output. Shown rather than dropped, so an operator can see that a
+#: value carried them.
+_CONTROL_ESCAPES = {
+    code: repr(chr(code))[1:-1] for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))
+}
+
+
+def plain_text(value: object) -> str:
+    """Render an untrusted value as literal text for a Rich console.
+
+    Control characters become visible escapes and markup is escaped, so the
+    result can sit in a table cell or inside our own markup and still print
+    exactly what the value contains. Slice a value *before* passing it here:
+    cutting the result could split an escape and expose the markup after it.
+    """
+    return escape_markup(str(value).translate(_CONTROL_ESCAPES))
 
 
 def build_run_report(result: PipelineResult) -> dict[str, Any]:
@@ -238,7 +266,7 @@ def render_console_summary(result: PipelineResult) -> Any:
             RunStatus.SKIPPED: "dim",
         }.get(task.status, "white")
         table.add_row(
-            task.task_name,
+            plain_text(task.task_name),
             f"[{task_style}]{task.status.value}[/{task_style}]",
             f"{task.duration_seconds:.2f}",
             str(task.metrics.rows_in),
@@ -253,11 +281,12 @@ def render_console_summary(result: PipelineResult) -> Any:
         f"≈ {result.throughput_rows_per_second:.0f} rows/s"
     )
     if result.error is not None:
-        summary += f"\n[red]{html.unescape(str(result.error))[:400]}[/red]"
+        # The error quotes source data, so it is the likeliest value to carry markup.
+        summary += f"\n[red]{plain_text(html.unescape(str(result.error))[:400])}[/red]"
 
     return Panel(
         Group(summary, "", table),
-        title=f"{result.pipeline_name}  ·  {result.execution_id}",
+        title=f"{plain_text(result.pipeline_name)}  ·  {plain_text(result.execution_id)}",
         border_style=style,
     )
 
@@ -280,6 +309,7 @@ __all__ = [
     "build_dashboard_report",
     "build_run_report",
     "default_report_path",
+    "plain_text",
     "render_console_summary",
     "write_html",
     "write_json",

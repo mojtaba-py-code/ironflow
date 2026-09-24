@@ -26,6 +26,7 @@ from ironflow.observability.logging import configure_logging
 from ironflow.repositories.database import Database
 from ironflow.security.rbac import Principal
 from ironflow.services.pipeline_service import PipelineService
+from ironflow.services.reporting import plain_text
 
 logger = logging.getLogger(__name__)
 
@@ -110,16 +111,21 @@ class CliContext:
         self.error_console.print(f"[yellow]warning:[/yellow] {message}")
 
     def fail(self, error: Exception | str, *, code: int = EXIT_FAILED) -> None:
-        """Report an error and exit with ``code``."""
+        """Report an error and exit with ``code``.
+
+        Messages and context values quote whatever failed - a connector type
+        from a pipeline file, a path, a value from a source row - so they are
+        printed as plain text, never as markup.
+        """
         if isinstance(error, IronFlowError):
             if self.json_output:
                 self._print_json(json.dumps(error.to_dict(), default=str))
             else:
-                self.error_console.print(f"[bold red]error:[/bold red] {error.message}")
+                self.error_console.print(f"[bold red]error:[/bold red] {plain_text(error.message)}")
                 for key, value in sorted(error.context.items()):
-                    self.error_console.print(f"  [dim]{key}:[/dim] {value}")
+                    self.error_console.print(f"  [dim]{key}:[/dim] {plain_text(value)}")
         else:
-            self.error_console.print(f"[bold red]error:[/bold red] {error}")
+            self.error_console.print(f"[bold red]error:[/bold red] {plain_text(error)}")
         raise typer.Exit(code)
 
 
@@ -138,6 +144,10 @@ def _console(*, stderr: bool = False) -> Console:
     the terminal can render them and substitutes ``?`` where it cannot.  The
     encoding itself is left alone: forcing UTF-8 onto a legacy console would
     trade a crash for mojibake.
+
+    Emoji codes are off: Rich would turn ``:lock:`` inside a pipeline's owner
+    into a padlock, and markup escaping has no equivalent for them.  The CLI's
+    own messages use none.
     """
     stream = sys.stderr if stderr else sys.stdout
     reconfigure = getattr(stream, "reconfigure", None)
@@ -145,7 +155,7 @@ def _console(*, stderr: bool = False) -> Console:
         # Absent under pytest's capture and on a closed stream; neither is fatal.
         with suppress(OSError, ValueError):
             reconfigure(errors="replace")
-    return Console(stderr=stderr)
+    return Console(stderr=stderr, emoji=False)
 
 
 def build_context(

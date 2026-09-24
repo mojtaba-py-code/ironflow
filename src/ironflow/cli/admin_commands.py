@@ -17,6 +17,7 @@ from ironflow.config.models import PipelineSpec
 from ironflow.connectors.factory import describe_connectors
 from ironflow.core.errors import IronFlowError
 from ironflow.security.crypto import CryptoService, generate_key
+from ironflow.services.reporting import plain_text
 from ironflow.transformation.base import TRANSFORM_REGISTRY
 from ironflow.validation.rules import RULE_REGISTRY
 from ironflow.version import APP_TITLE
@@ -42,7 +43,7 @@ def config_show(ctx: typer.Context) -> None:
     table.add_column("Setting", style="bold")
     table.add_column("Value")
     for key, value in sorted(payload.items()):
-        table.add_row(key, str(value))
+        table.add_row(key, plain_text(value))
     cli.emit(payload, table)
 
 
@@ -54,7 +55,9 @@ def config_check(ctx: typer.Context) -> None:
     problems = health["production_problems"]
 
     cli.info(f"database: {'[green]ok[/green]' if health['database'] else '[red]unreachable[/red]'}")
-    cli.info(f"pipelines: {health['pipelines_discovered']} in {health['pipelines_dir']}")
+    cli.info(
+        f"pipelines: {health['pipelines_discovered']} in {plain_text(health['pipelines_dir'])}"
+    )
     cli.info(f"environment: {health['environment']}")
     if problems:
         cli.info("[red]production hardening problems:[/red]")
@@ -81,7 +84,7 @@ def config_schema(
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(schema, indent=2), encoding="utf-8")
-        cli.info(f"schema written to {output}")
+        cli.info(f"schema written to {plain_text(output)}")
         return
     cli.emit(schema, Syntax(json.dumps(schema, indent=2), "json", theme="ansi_dark"))
 
@@ -118,7 +121,7 @@ def config_init(
         target.write_text(content, encoding="utf-8")
         created.append(relative)
 
-    cli.info(f"[green]scaffolded[/green] {len(created)} file(s) in {root}")
+    cli.info(f"[green]scaffolded[/green] {len(created)} file(s) in {plain_text(root)}")
     for item in created:
         cli.info(f"  + {item}")
     cli.emit({"root": str(root), "created": created})
@@ -234,12 +237,13 @@ def schedule_list(ctx: typer.Context) -> None:
     table.add_column("Schedule")
     table.add_column("Timezone")
     table.add_column("Next run")
+    # The timezone is free text from the pipeline file; it is not validated.
     for job in jobs:
         table.add_row(
-            str(job["pipeline"]),
-            str(job["schedule"]),
-            str(job["timezone"]),
-            str(job["next_run"])[:19],
+            plain_text(job["pipeline"]),
+            plain_text(job["schedule"]),
+            plain_text(job["timezone"]),
+            plain_text(str(job["next_run"])[:19]),
         )
     if not jobs:
         cli.info("[yellow]No pipelines declare a schedule.[/yellow]")
@@ -345,14 +349,15 @@ def state_watermarks(
     table.add_column("Value")
     table.add_column("Rows", justify="right")
     table.add_column("Updated")
+    # A watermark value is the high-water mark read from source data.
     for row in rows:
         table.add_row(
-            str(row["pipeline"]),
-            str(row["task"]),
-            str(row["column"]),
-            str(row["value"]),
+            plain_text(row["pipeline"]),
+            plain_text(row["task"]),
+            plain_text(row["column"]),
+            plain_text(row["value"]),
             str(row["rows_last_run"]),
-            str(row["updated_at"] or "")[:19],
+            plain_text(str(row["updated_at"] or "")[:19]),
         )
     if not rows:
         cli.info("[yellow]No watermarks recorded.[/yellow]")
@@ -387,13 +392,15 @@ def state_audit(
     table.add_column("Actor")
     table.add_column("Outcome")
     table.add_column("Resource")
+    # An actor can be an API token's subject, and whoever can write the file
+    # controls every field in it.
     for entry in entries:
         table.add_row(
-            str(entry.get("timestamp", ""))[:19],
-            str(entry.get("action", "")),
-            str(entry.get("actor", "")),
-            str(entry.get("outcome", "")),
-            str(entry.get("resource", "") or "-"),
+            plain_text(str(entry.get("timestamp", ""))[:19]),
+            plain_text(entry.get("action", "")),
+            plain_text(entry.get("actor", "")),
+            plain_text(entry.get("outcome", "")),
+            plain_text(entry.get("resource", "") or "-"),
         )
     if not entries:
         cli.info("[yellow]No audit entries recorded.[/yellow]")
