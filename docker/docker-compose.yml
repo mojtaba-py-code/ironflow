@@ -1,7 +1,11 @@
 # Local stack: PostgreSQL for control-plane state, the API/dashboard, and the
 # scheduler. Run from the repository root:
 #
+#   export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
 #   docker compose -f docker/docker-compose.yml up --build
+#
+# There is no default database password: a stack that starts with one ships
+# it, so compose refuses to start until POSTGRES_PASSWORD is set.
 #
 # The scheduler runs as a single replica on purpose: it holds no distributed
 # lock, so two replicas would double-trigger every job.
@@ -19,7 +23,7 @@ x-ironflow-common: &ironflow-common
     IRONFLOW_HOME: /var/lib/ironflow
     IRONFLOW_PIPELINES_DIR: /etc/ironflow/pipelines
     IRONFLOW_DATA_ROOTS: /data
-    IRONFLOW_STATE_DATABASE_URL: postgresql+psycopg://ironflow:${POSTGRES_PASSWORD:-ironflow}@postgres:5432/ironflow
+    IRONFLOW_STATE_DATABASE_URL: postgresql+psycopg://ironflow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/ironflow
     IRONFLOW_ENCRYPTION_KEY: ${IRONFLOW_ENCRYPTION_KEY:-}
     # These two go together: with auth on, a signing secret under 32 characters
     # makes every token forgeable, so the container refuses to start without one.
@@ -32,7 +36,12 @@ x-ironflow-common: &ironflow-common
   depends_on:
     postgres:
       condition: service_healthy
-  # Hardening that costs nothing locally and matches production.
+  # Hardening that costs nothing locally and matches production. The root
+  # filesystem is read-only: IronFlow writes only to its state volume and /data,
+  # so anything else trying to write is something to know about.
+  read_only: true
+  tmpfs:
+    - /tmp
   security_opt:
     - no-new-privileges:true
   cap_drop:
@@ -44,7 +53,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ironflow
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ironflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: ironflow
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -67,7 +76,11 @@ services:
     ports:
       - "127.0.0.1:8080:8080"   # bound to loopback; put a proxy in front to expose it
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4).status != 200)"
       interval: 30s
       timeout: 5s
       retries: 3
