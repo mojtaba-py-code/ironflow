@@ -188,6 +188,10 @@ jobs:
           tags: ironflow:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Always rebuild the runtime stage. Its `apt-get upgrade` layer would
+          # otherwise come back from the cache, so a distribution security fix
+          # released since then (OpenSSL, 2026-09) would never reach the image.
+          no-cache-filters: runtime
 
       # The restrictions production should apply, so an image that quietly
       # needs a writable root, root privileges or a capability fails here.
