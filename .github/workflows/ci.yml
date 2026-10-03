@@ -38,6 +38,10 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      # Unlocked on purpose, in every test job: IronFlow is also a library, so CI
+      # tests against the newest dependency versions a fresh install resolves to
+      # (see .github/dependabot.yml). What ships is hash-locked: the image installs
+      # requirements/runtime.txt, and the Security workflow audits the locks.
       - name: Install
         run: pip install -e ".[dev,columnar,excel,remote,api]"
 

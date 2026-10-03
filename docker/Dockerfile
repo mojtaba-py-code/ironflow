@@ -27,12 +27,18 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+COPY requirements/build.txt requirements/runtime.txt ./requirements/
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 
+# Every third-party package comes from a hash-locked file (requirements/, made by
+# `make lock`): a release replaced or tampered with on the index fails the build
+# instead of entering the image. The project itself is then built without build
+# isolation and without dependency resolution, so nothing unpinned is downloaded.
 # Install into a self-contained prefix that the runtime stage copies wholesale.
-RUN python -m pip install --upgrade pip \
- && python -m pip install --prefix=/install ".[columnar,excel,remote,api,postgres]"
+RUN python -m pip install --require-hashes --no-deps -r requirements/build.txt \
+ && python -m pip install --require-hashes --no-deps --prefix=/install -r requirements/runtime.txt \
+ && python -m pip install --no-deps --no-build-isolation --prefix=/install .
 
 # --------------------------------------------------------------------------- #
 # Runtime

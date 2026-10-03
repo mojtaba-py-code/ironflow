@@ -1,0 +1,4 @@
+# Release and audit tooling used by .github/workflows (release.yml, security.yml).
+build==1.6.1
+cyclonedx-bom==7.4.0
+pip-audit==2.10.1

@@ -19,6 +19,8 @@
 !README.md
 !LICENSE
 !src/
+!requirements/build.txt
+!requirements/runtime.txt
 
 # Re-excluded inside the tree admitted above: build metadata and bytecode from
 # the host would otherwise be baked into the wheel and the image layer, and a

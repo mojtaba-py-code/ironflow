@@ -2,7 +2,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help install install-dev lint format typecheck test test-fast coverage \
-        security check clean build docker docker-run run-example serve scaffold
+        security check clean build docker docker-run run-example serve scaffold lock
 
 PYTHON ?= python
 PKG    := ironflow
@@ -53,6 +53,15 @@ clean:  ## Remove build and cache artefacts
 build: clean  ## Build the wheel and sdist
 	$(PYTHON) -m pip install --quiet build
 	$(PYTHON) -m build
+
+UV        ?= uv
+LOCK_ARGS := --universal --python-version 3.11 --generate-hashes --custom-compile-command "make lock" --quiet
+
+lock:  ## Regenerate the hash-locked requirements/*.txt (needs uv; keeps existing pins)
+	$(UV) pip compile pyproject.toml $(LOCK_ARGS) --extra columnar --extra excel --extra remote --extra api --extra postgres -o requirements/runtime.txt
+	$(UV) pip compile pyproject.toml $(LOCK_ARGS) --extra columnar --extra excel --extra remote --extra api --extra postgres --extra mysql -o requirements/audit.txt
+	$(UV) pip compile requirements/build.in $(LOCK_ARGS) -o requirements/build.txt
+	$(UV) pip compile requirements/tools.in $(LOCK_ARGS) -o requirements/tools.txt
 
 docker:  ## Build the container image
 	docker build -f docker/Dockerfile -t ironflow:latest .

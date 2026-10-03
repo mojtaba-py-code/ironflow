@@ -121,6 +121,25 @@ class TestContainer:
         rules = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
         assert rules[0] == "*"
 
+    def test_the_image_installs_only_hash_locked_packages(self):
+        """Third-party code enters only from a hash-locked file; the project resolves nothing."""
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        installs = re.findall(r"pip install ([^\\\n]+)", text)
+        assert len(installs) == 3, installs
+        for args in installs:
+            assert "--no-deps" in args, args
+            locked = "--require-hashes" in args and " -r requirements/" in args
+            project = "--no-build-isolation" in args and args.rstrip().endswith(" .")
+            assert locked or project, args
+        assert "--upgrade pip" not in text
+
+    def test_the_build_context_admits_the_locks_the_image_copies(self):
+        rules = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        copied = re.findall(r"requirements/[\w.-]+\.txt", DOCKERFILE.read_text(encoding="utf-8"))
+        assert copied
+        for path in set(copied):
+            assert f"!{path}" in rules, path
+
 
 class TestCompose:
     @pytest.fixture
@@ -174,6 +193,30 @@ class TestInstallAdvice:
 
     def test_a_missing_extra_is_named_by_its_packages(self):
         assert install_hint("api") == "pip install 'fastapi>=0.111' 'uvicorn[standard]>=0.29'"
+
+
+@pytest.mark.parametrize(
+    "lock", sorted((ROOT / "requirements").glob("*.txt")), ids=lambda path: path.name
+)
+def test_every_locked_requirement_is_pinned_with_hashes(lock: Path):
+    """`pip install --require-hashes` refuses a lock with a loose or unhashed line."""
+    requirements: list[tuple[str, int]] = []
+    for line in lock.read_text(encoding="utf-8").splitlines():
+        if re.match(r"[A-Za-z0-9]", line):
+            requirements.append((line, 0))
+        elif "--hash=sha256:" in line and requirements:
+            name, hashes = requirements[-1]
+            requirements[-1] = (name, hashes + 1)
+    assert requirements, lock.name
+    for requirement, hashes in requirements:
+        pinned = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]+\])?==[^\s;]+", requirement)
+        assert pinned, requirement
+        assert hashes, requirement
+
+
+def test_the_locks_cover_what_the_image_and_the_audit_install():
+    names = {path.name for path in (ROOT / "requirements").glob("*.txt")}
+    assert {"build.txt", "runtime.txt", "audit.txt", "tools.txt"} <= names
 
 
 def test_dependabot_limits_routine_pip_updates_to_the_toolchain():
