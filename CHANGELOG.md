@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Hash-locked supply chain for what ships.** The container image installs its
+  dependencies and the build backend from hash-locked files in `requirements/`
+  (`make lock`), and builds the project without build isolation, so a package
+  replaced or tampered with on the index fails the build instead of entering the
+  image. The release and audit tooling (`build`, `cyclonedx-bom`, `pip-audit`)
+  is hash-locked as well. The weekly dependency audit now audits the locked set
+  and fails when the lock no longer satisfies `pyproject.toml`. CI test jobs
+  still install the newest versions on purpose, to catch breakage early.
+- **Dependabot waits 7 days before proposing a new release** (cooldown), so a
+  compromised or broken release is usually pulled before it reaches this repository.
+  Security updates are not delayed.
+
 ## [1.1.0] - 2026-09-24
 
 A security release. The whole codebase went through an adversarial review -

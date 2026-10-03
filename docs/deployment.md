@@ -26,6 +26,15 @@ Each release also carries a CycloneDX SBOM (`ironflow-X.Y.Z.cdx.json`) and a
 `SHA256SUMS` file. From source, `pip install ".[columnar,excel,api]"` in a
 checkout of the tag does the same.
 
+For a reproducible install with every dependency verified by hash - the set the
+container image ships - install the lock first, then the project without
+resolving anything else:
+
+```bash
+pip install --require-hashes --no-deps -r requirements/runtime.txt
+pip install --no-deps .
+```
+
 Extras are opt-in so a slim image stays slim. `pyarrow` alone is ~90 MB.
 
 | Extra | Adds |

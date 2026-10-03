@@ -1,6 +1,9 @@
 # Automated dependency updates. This project reads untrusted files and calls
 # out over HTTP on a schedule, so an unpatched parser or HTTP-client CVE is
 # reachable from the data a pipeline processes rather than only from the host.
+# Every ecosystem waits 7 days before proposing a new release (cooldown), so a
+# compromised or broken release is usually pulled before it reaches this repository.
+# Security updates are not delayed: advisories raise them immediately.
 version: 2
 updates:
   # Runtime dependencies keep permissive lower bounds on purpose: raising a
@@ -13,6 +16,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     allow:
       - dependency-name: "pytest*"
       - dependency-name: "ruff"
@@ -29,6 +34,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -41,6 +48,8 @@ updates:
     directory: "/docker"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     ignore:
       - dependency-name: "python"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]

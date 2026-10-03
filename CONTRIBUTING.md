@@ -11,6 +11,12 @@ make install-dev                                 # or: pip install -e ".[dev,col
 `make install-dev` also installs the pre-commit hooks, which mirror the CI lint
 job — a red build is then caught before the push rather than after it.
 
+After changing a dependency in `pyproject.toml`, run `make lock` (it needs
+[uv](https://docs.astral.sh/uv/)) and commit `requirements/`: the container image
+and the Security workflow install those hash-locked files, and the audit job
+fails when they no longer satisfy `pyproject.toml`. `make lock` keeps the existing
+pins; delete a file under `requirements/` first to re-resolve it from scratch.
+
 Use a virtual environment, not the system interpreter. A globally installed
 package hides an undeclared dependency: the suite passes for you and a fresh
 clone fails.

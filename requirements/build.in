@@ -1,0 +1,4 @@
+# Build backend for the Docker image (installed with --no-build-isolation, so nothing
+# unpinned is downloaded while the project is built). Mirrors [build-system] in pyproject.toml.
+setuptools>=77
+wheel

@@ -45,10 +45,12 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      # build and cyclonedx-bom come from the hash-locked requirements/tools.txt.
+      - name: Install the release tooling (hash-locked)
+        run: python -m pip install --require-hashes --no-deps -r requirements/tools.txt
+
       - name: Build the sdist and wheel
-        run: |
-          python -m pip install "build==1.6.1"
-          python -m build
+        run: python -m build
 
       - name: Install the wheel into a clean environment and run it
         run: |
@@ -60,7 +62,6 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          python -m pip install "cyclonedx-bom==7.4.0"
           cyclonedx-py environment /tmp/wheel-check/bin/python --output-reproducible \
             --of JSON -o "dist/ironflow-${VERSION}.cdx.json"
 
